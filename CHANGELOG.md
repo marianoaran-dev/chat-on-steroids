@@ -33,7 +33,7 @@ the app refuses the extension and asks you to reload the matching copy.
 
 Reload the companion extension and refresh all CoS plugins in ChatGPT after updating.
 
-## [2.1.13] — i am very sad. openai theatend to ban my account for whatever reason. anthropic support blocks me. money tight.
+## [2.1.13]
 
 refreh your extension and all CoS plugins in chatgpt
 
