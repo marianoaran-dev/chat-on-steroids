@@ -20,7 +20,7 @@ the app refuses the extension and asks you to reload the matching copy.
 - Record bounded, accurate Compact & Resume marker outcomes without repeating the same notice on every reload.
 - Give observation-journal deliveries and split retries a 60-second durable-write allowance while preserving unacknowledged observations after timeout.
 
-## [2.1.14] — Death to Anthropic and OpenAI. Join the resistance @dummerspast39 x
+## [2.1.14]
 
 - Add the optional animated Tur Tur Sahur desktop companion.
 - Show normal and unattributed reload warnings only in the last 30 seconds; retain the five-minute Pro warning.
