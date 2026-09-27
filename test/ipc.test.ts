@@ -8,6 +8,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
 
 type Handler = (event: unknown, payload: unknown) => Promise<unknown>;
 const handlers = new Map<string, Handler>();
@@ -32,7 +33,7 @@ vi.mock('electron', () => ({
 }));
 
 // This suite owns IPC behavior, not Electron's packaged-vs-checkout path discovery.
-vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd() }));
+vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd(), shippedExtensionBuild: () => null, extensionUpdateOffer: () => null, prepareExtensionUpdate: () => null }));
 vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: vi.fn(async () => 'chrome.exe') }));
 
 const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
@@ -84,6 +85,47 @@ const renameRoot = (payload: unknown): Promise<any> => handlers.get('roots:renam
 const removeRoot = (payload: unknown): Promise<any> => handlers.get('roots:remove')!(null, payload) as Promise<any>;
 const sessionEvents = (payload: unknown): Promise<any> => handlers.get('sessions:events')!(null, payload) as Promise<any>;
 const sessionList = (): Promise<any> => handlers.get('sessions:list')!(null, undefined) as Promise<any>;
+
+it('saves port choices, merges stale snapshots and serializes concurrent port edits', async () => {
+  const ports = await import('../src/main/bridge-ports.js');
+  const bridge = await import('../src/main/bridge.js');
+  const selection = vi.spyOn(ports, 'bridgePortSelection').mockReturnValue({ candidates: [0], overridden: false });
+  try {
+    const base = getConfig();
+    const results = await Promise.all([8767, 8768].map(browserBridgePort => save({ ...base, ui: { ...base.ui, browserBridgePort } }, base)));
+    expect(results.every(result => result.ok)).toBe(true);
+    const active = bridge.bridgePort();
+    expect(await save({ ...base, ui: { ...base.ui, theme: 'light' } }, base)).toMatchObject({ ok: true });
+    expect(getConfig().ui).toMatchObject({ browserBridgePort: 8768, theme: 'light' });
+    expect(bridge.bridgePort()).toBe(active);
+  } finally { selection.mockRestore(); }
+});
+
+it('rejects occupied port edits through Settings IPC and preserves the old bridge and disk', async () => {
+  const http = await import('node:http');
+  const ports = await import('../src/main/bridge-ports.js');
+  const bridge = await import('../src/main/bridge.js');
+  await startBridge(); const old = bridge.bridgePort();
+  const blocker = http.createServer();
+  await new Promise<void>(resolve => blocker.listen(0, '127.0.0.1', resolve));
+  const selection = vi.spyOn(ports, 'bridgePortSelection').mockReturnValue({ candidates: [(blocker.address() as { port: number }).port], overridden: false });
+  try {
+    const base = getConfig(); const disk = await fs.readFile(path.join(dir, 'config.json'), 'utf8');
+    expect(await save({ ...base, ui: { ...base.ui, browserBridgePort: 8767 } }, base)).toMatchObject({ ok: false });
+    expect(getConfig()).toBe(base); expect(bridge.bridgePort()).toBe(old);
+    expect(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).toBe(disk);
+  } finally { selection.mockRestore(); await new Promise<void>(resolve => blocker.close(() => resolve())); }
+});
+
+it('enforces the environment override for explicit edits while accepting unrelated saves', async () => {
+  const base = getConfig();
+  // vitest.config.ts supplies the real CLF_BRIDGE_PORTS=0 override.
+  const result = await save({ ...base, ui: { ...base.ui, browserBridgePort: 8767 } }, base);
+  expect(result).toMatchObject({ ok: false, error: expect.stringContaining('CLF_BRIDGE_PORTS') });
+  expect(getConfig().ui.browserBridgePort).toBe('auto');
+  const unrelated = await save({ ...base, ui: { ...base.ui, theme: 'light' } }, base);
+  expect(unrelated).toMatchObject({ ok: true, data: { bridge: { portOverridden: true } } });
+});
 
 it('persists arbitrary colors through Settings IPC and preserves concurrent per-field edits', async () => {
   const { defaultAppearance } = await import('../src/shared/appearance.js');
@@ -249,7 +291,7 @@ it('round-trips Goal controls and cannot revive old periodic input when Off canc
     await store.observeSessionModel(session.id, 'periodic-settings-chat', 'gpt-6-astra', Date.now());
     const row = await outbox.enqueueInput({ id: 'f0f00014-1111-4111-8111-111111111111', sessionId: session.id,
       text: 'Pending automatic instruction', mode: 'auto', dueAt: Date.now(), model: null, reasoningEffort: null },
-      { turnId: 'periodic-turn', periodic: false, userRequested: true });
+      { turnId: 'periodic-turn', periodic: false, mode: 'goal', userRequested: true });
     // Seed an old-version row; current code deliberately refuses new periodic input.
     await writeDurableNow('session-input', [{ ...row, finishOwner: { turnId: 'periodic-turn', periodic: true } }]);
     outbox.resetInputForTests();
@@ -327,6 +369,38 @@ it('adds picker-selected projects, reuses containing approval, and leaves cancel
   expect(getConfig().roots).toHaveLength(1);
   expect((await fs.stat(folder)).isDirectory()).toBe(true);
   expect(await handlers.get('projects:remove')!(null, { id: folder })).toMatchObject({ ok: false });
+  expect(await handlers.get('projectGit:snapshot')!(null, { projectId: folder })).toMatchObject({ ok: false });
+  expect(await handlers.get('projectGit:diff')!(null, { projectId: first.data.id, path: '' })).toMatchObject({ ok: false });
+  expect(await handlers.get('sessions:toolEditReview')!(null, {
+    sessionId: first.data.id, callId: 'not-a-uuid', changeIndex: 0
+  })).toMatchObject({ ok: false });
+});
+
+it('does not install a stale Git watch after a newer Files project watch', async () => {
+  const { ProjectFileWatchSet } = await import('../src/main/project-file-watcher.js');
+  const { ProjectGitWatchSet } = await import('../src/main/project-git.js');
+  const contents = Object.assign(new EventEmitter(), { send: vi.fn(), isDestroyed: () => false });
+  currentWindow = { isDestroyed: () => false, webContents: contents } as any;
+  const firstId = '11111111-1111-4111-8111-111111111111';
+  const secondId = '22222222-2222-4222-8222-222222222222';
+  let finishFirst!: () => void, finishSecond!: () => void;
+  const fileSync = vi.spyOn(ProjectFileWatchSet.prototype, 'sync').mockImplementation(projectId =>
+    new Promise<void>(resolve => { if (projectId === firstId) finishFirst = resolve; else finishSecond = resolve; }));
+  const gitSync = vi.spyOn(ProjectGitWatchSet.prototype, 'sync').mockResolvedValue();
+  try {
+    const watch = (projectId: string) => handlers.get('projectFiles:watch')!(null, { projectId, directories: [''] });
+    const first = watch(firstId);
+    const second = watch(secondId);
+    finishSecond();
+    expect(await second).toMatchObject({ ok: true, data: true });
+    finishFirst();
+    expect(await first).toMatchObject({ ok: true, data: false });
+    expect(gitSync).toHaveBeenCalledOnce();
+    expect(gitSync).toHaveBeenCalledWith(secondId);
+  } finally {
+    fileSync.mockRestore();
+    gitSync.mockRestore();
+  }
 });
 
 /** The whole settings object the renderer sends, with the parts a test cares about set. */
@@ -335,6 +409,7 @@ function settings(over: { record: boolean; multiAgent: boolean }) {
   return {
     capabilities: base.capabilities,
     readOnly: base.readOnly,
+    commandAllowlist: base.commandAllowlist,
     tunnel: base.tunnel,
     ui: base.ui,
     sessions: { ...base.sessions, record: over.record },
@@ -428,6 +503,8 @@ describe('explicit settings replace the published tool contract', () => {
     };
     try {
       const before = snapshot();
+      const beforeState = await handlers.get('state:get')!(null, undefined) as any;
+      expect(beforeState.data.connectorSchemas.core).toBe(before.schemaId);
       const tool = kind === 'finish' ? 'session_finish' : 'exec_command';
       expect(before.tools.map(row => row.name)).toContain(tool);
       expect(before.tools.map(row => row.name)).not.toContain('session');
@@ -437,6 +514,8 @@ describe('explicit settings replace the published tool contract', () => {
         : { capabilities: { ...current.capabilities, command: false } }) };
       expect((await save(patch)).ok).toBe(true);
       const after = snapshot();
+      const afterState = await handlers.get('state:get')!(null, undefined) as any;
+      expect(afterState.data.connectorSchemas.core).toBe(after.schemaId);
       expect(after.tools.map(row => row.name)).not.toContain(tool);
       expect(after.tools.map(row => row.name)).not.toContain('session');
       expect(after.schemaId).not.toBe(before.schemaId);
@@ -799,6 +878,28 @@ describe('settings writes from more than one UI', () => {
       height: 36, color: '#00000000', symbolColor: '#ffffff'
     });
     expect(getConfig().goal.enabled).toBe(false);
+  });
+
+  it('persists command policy fields independently across stale renderer saves', async () => {
+    const base = defaultConfig();
+    await saveConfig(base);
+    const enabled = await save({
+      ...base, commandAllowlist: { enabled: true, mode: 'deny', rules: ['git status', 'git diff *'] }
+    }, base);
+    expect(enabled.ok, enabled.error).toBe(true);
+
+    const stale = await save({ ...base, ui: { ...base.ui, minimizeToTray: !base.ui.minimizeToTray } }, base);
+    expect(stale.ok, stale.error).toBe(true);
+    expect(getConfig().commandAllowlist).toEqual({ enabled: true, mode: 'deny', rules: ['git status', 'git diff *'] });
+
+    const current = getConfig();
+    expect((await save({
+      ...current, commandAllowlist: { ...current.commandAllowlist, enabled: false }
+    }, current)).ok).toBe(true);
+    expect(getConfig().commandAllowlist).toEqual({ enabled: false, mode: 'deny', rules: ['git status', 'git diff *'] });
+    expect((await save({
+      ...getConfig(), commandAllowlist: { enabled: true, mode: 'allow', rules: ['git status; whoami'] }
+    }, getConfig())).ok).toBe(false);
   });
 
   it('preserves a newer unattributed-call choice across an unrelated stale renderer save', async () => {

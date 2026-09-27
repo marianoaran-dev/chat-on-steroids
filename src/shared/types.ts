@@ -1,6 +1,8 @@
 import type { ReasoningEffort } from './session.js';
 import { WINDOWS_COMPUTER_READ_METHODS, WINDOWS_COMPUTER_INPUT_METHODS } from './windows-computer.js';
 import { BROWSER_READ_TOOLS, BROWSER_WRITE_TOOLS } from './browser-control.js';
+import type { CommandAllowlistSettings } from './command-allowlist.js';
+export type { CommandAllowlistSettings } from './command-allowlist.js';
 /** Types shared between the main process and the renderer. No runtime logic here. */
 
 /**
@@ -133,6 +135,7 @@ export interface UiPrefs {
   /** Maintenance may reuse existing tabs but cannot open helpers or missing chats. */
   browserOnly?: boolean;
   backgroundChats?: boolean;
+  browserBridgePort?: import('./browser-bridge.js').BrowserBridgePort;
   /** Opt-in browser automation for changed connector tool schemas. */
   autoRefreshPlugins?: boolean;
   /** Actual app-owned tabs to retain; active work and drafts stay protected. Omitted uses workers + 2. */
@@ -142,6 +145,8 @@ export interface UiPrefs {
   finishAction?: 'notify' | 'goal';
   finishLeadMinutes?: number;
   developerMode?: boolean;
+  /** Rotating joke words instead of "Working" in a chat's status line. Off by default. */
+  playfulStatus?: boolean;
   minimizeToTray: boolean;
   autoConnect: boolean;
   startAtLogin?: boolean;
@@ -186,6 +191,8 @@ export interface CompactionSettings {
   auto: boolean;
   /** Estimated recorded tokens at which automatic compaction fires. */
   autoTokens: number;
+  /** Editable content instructions for the brief; protocol/recovery framing stays code-owned. */
+  handoffPrompt: string;
 }
 
 /**
@@ -302,6 +309,12 @@ export interface MultiAgentSettings {
    * recovered, whatever this says.
    */
   recoverAgentTabs: boolean;
+  /**
+   * Hold a Goal/Loop chat's next automatic step until the workers it delegated to have
+   * stopped. Their reports land in the same chat, so deciding or sending before that reads a
+   * context that is about to change. Off by default; a chat with no workers is never held.
+   */
+  waitForSubAgents?: boolean;
 }
 
 /** The user's own additions to what each MCP connector tells the model about itself. */
@@ -321,6 +334,7 @@ export interface Config {
   sessions: SessionSettings;
   compaction: CompactionSettings;
   multiAgent: MultiAgentSettings;
+  commandAllowlist: CommandAllowlistSettings;
   goal: GoalSettings;
   mcp: McpSettings;
 }
@@ -460,6 +474,10 @@ export interface LogEntry {
 
 /** What the renderer needs to know about the extension bridge, without any secrets. */
 export interface BridgeStatus {
+  /** Effective environment override, independent of the saved Settings choice. */
+  portOverridden?: boolean;
+  /** Last startup failure; a rejected settings change keeps the working bridge status. */
+  error?: string | null;
   running: boolean;
   port: number | null;
   /** Durable authorization: true once a browser extension has been issued this app's token. */
@@ -635,6 +653,12 @@ export function browserExtensionRequired(_config: Pick<Config, 'sessions' | 'mul
 export interface AppState {
   config: Config;
   status: ConnectionStatus;
+  /**
+   * Exact declaration fingerprints for connectors currently published by the local MCP server.
+   * Missing entries mean that surface is not published right now. These hashes describe the
+   * local contract only; they are not evidence that ChatGPT has refreshed its cached tools.
+   */
+  connectorSchemas: Partial<Record<SurfaceId, string>>;
   platform: PlatformInfo;
   /** Only packaged Windows builds may change the login item. */
   loginStartupAvailable?: boolean;

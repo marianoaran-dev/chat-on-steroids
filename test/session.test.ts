@@ -48,6 +48,7 @@ import {
   readEvents,
   readActivityEvents,
   readRecentEvents,
+  readToolEditReview,
   readLatestUserMessage,
   turnHasMcpCall,
   conversationHasMcpCallSince,
@@ -64,7 +65,8 @@ import {
   writeAsset
 } from '../src/main/session/store.js';
 import { summarizeToolCall } from '../src/main/session/summarize.js';
-import { HANDOFF_BRIEF_RULES, nativeHandoffPrompt } from '../src/main/session/handoff-prompt.js';
+import { nativeHandoffPrompt } from '../src/main/session/handoff-prompt.js';
+import { DEFAULT_HANDOFF_PROMPT } from '../src/shared/handoff.js';
 import {
   CHAT_ACTIVE_MS,
   CHAT_SILENCE_MS,
@@ -106,6 +108,39 @@ const evidence = (patch: Partial<ReturnType<typeof emptyEvidence>> = {}) => ({ .
 // ------------------------------------------------------------------- store
 
 describe('session store', () => {
+  it('keeps an exact tool edit review after later edits, but never invents one for failed or oversized calls', async () => {
+    const conversationId = 'conv-exact-edit-review';
+    const sessionId = await sessionForConversation(conversationId);
+    const changed = evidence({
+      changes: [{ path: '/project/src/main.ts', added: 1, removed: 1, approximate: false }],
+      reviews: [{ changeIndex: 0, before: 'one\n', after: 'two\n' }]
+    });
+    const first = await recordToolCall({ tool: 'apply_patch', args: { patch: 'first' },
+      content: [{ type: 'text', text: 'ok' }], outcome: 'ok', durationMs: 1, startedAt: Date.now(),
+      conversationId, sessionId, evidence: changed });
+    expect(first?.changes?.[0]?.reviewAssetId).toMatch(/^[a-f0-9]{32}\.txt$/);
+    const second = await recordToolCall({ tool: 'apply_patch', args: { patch: 'second' },
+      content: [{ type: 'text', text: 'ok' }], outcome: 'ok', durationMs: 1, startedAt: Date.now() + 1,
+      conversationId, sessionId, evidence: evidence({
+        changes: [{ path: '/project/src/main.ts', added: 1, removed: 1, approximate: false }],
+        reviews: [{ changeIndex: 0, before: 'two\n', after: 'three\n' }]
+      }) });
+    expect(await readToolEditReview(sessionId!, first!.callId, 0)).toMatchObject({ baseText: 'one\n', currentText: 'two\n' });
+    expect(await readToolEditReview(sessionId!, second!.callId, 0)).toMatchObject({ baseText: 'two\n', currentText: 'three\n' });
+    expect(await readToolEditReview(sessionId!, first!.callId, 1)).toBeNull();
+    const failed = await recordToolCall({ tool: 'apply_patch', args: { patch: 'failed' },
+      content: [{ type: 'text', text: 'failed' }], outcome: 'tool_execution_error', durationMs: 1, startedAt: Date.now() + 2,
+      conversationId, sessionId, evidence: changed });
+    expect(failed?.changes?.[0]?.reviewAssetId).toBeUndefined();
+    const huge = await recordToolCall({ tool: 'apply_patch', args: { patch: 'huge' },
+      content: [{ type: 'text', text: 'ok' }], outcome: 'ok', durationMs: 1, startedAt: Date.now() + 3,
+      conversationId, sessionId, evidence: evidence({
+        changes: [{ path: '/project/src/huge.ts', added: 1, removed: 0, approximate: false }],
+        reviews: [{ changeIndex: 0, before: '', after: 'x'.repeat(512 * 1024) }]
+      }) });
+    expect(huge?.changes?.[0]?.reviewAssetId).toBeUndefined();
+  });
+
   it('uses original call time and exact conversation for late attribution health proof', async () => {
     const conversationId = 'health-current';
     const session = await createSession({ title: 'attribution health', conversationId });
@@ -519,6 +554,219 @@ describe('session store', () => {
     const events = await readEvents(summary.id);
     expect(events.map((event) => event.seq)).toEqual([1, 2, 3, 4]);
     expect(events.map((event) => event.kind)).toEqual(kinds);
+  });
+
+  /**
+   * A file that cannot be read right now is not a file that holds nothing.
+   *
+   * Reported as #393 from Windows 11: thirteen `no valid metadata projection` warnings inside
+   * thirteen milliseconds across several sessions — one catalog sweep, which reads sixty-four
+   * folders at a time — and from then on the app behaved as if those chats did not exist.
+   * Genuine corruption does not arrive in every session at the same instant; a share lock or an
+   * exhausted descriptor table does. Every read path here used to answer such a failure with the
+   * value that means "empty", and the empty answer is the destructive one: an unread journal is
+   * reported as sequence zero, and the projection is then stamped over a full session.
+   */
+  it('answers a locked journal with a failure instead of stamping the session empty', async () => {
+    const session = await createSession({ title: 'locked journal', conversationId: 'locked-journal' });
+    await appendEvent(session.id, { time: 100, source: 'extension', kind: 'turn_start', turnId: 'work' });
+    await appendEvent(session.id, { time: 200, source: 'extension', kind: 'turn_end', turnId: 'work', outcome: 'completed' });
+    await flushSessions();
+    const folder = path.join(sessionsRoot(), session.id);
+    const metaBefore = await fs.readFile(path.join(folder, 'meta.json'), 'utf8');
+    const journalBefore = await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8');
+    resetRecorderForTests();
+    resetSessionStoreForTests();
+
+    const stat = fs.stat.bind(fs);
+    const spy = vi.spyOn(fs, 'stat').mockImplementation((async (target, ...args) => {
+      if (String(target) === path.join(folder, 'events.jsonl')) throw Object.assign(new Error('locked'), { code: 'EBUSY' });
+      return stat(target, ...args);
+    }) as typeof fs.stat);
+    try {
+      await expect(getSession(session.id)).rejects.toThrow(/locked/);
+    } finally {
+      spy.mockRestore();
+    }
+
+    // Nothing was rewritten while the answer was unknown, so the session is simply itself again.
+    expect(await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8')).toBe(journalBefore);
+    expect(await fs.readFile(path.join(folder, 'meta.json'), 'utf8')).toBe(metaBefore);
+    resetSessionStoreForTests();
+    expect((await readEvents(session.id)).map(event => event.seq)).toEqual([1, 2]);
+    expect((await getSession(session.id))?.timelineTurns?.work).toMatchObject({ time: 100 });
+  });
+
+  /**
+   * An empty folder is not a session, and does not get a warning about one.
+   *
+   * `refusing to treat it as an empty session` was written for metadata that went missing under
+   * a session that still has its history. A folder with nothing in it says the same sentence,
+   * and it reached two bug reports that way: measured from a reporter's log on 2026-09-25, the
+   * same pair of warnings every few minutes for hours, both files simply absent, nothing lost
+   * and nothing for anybody to do about it.
+   */
+  it('says nothing about a session folder that holds nothing, and still reports one that lost its metadata', async () => {
+    const empty = path.join(sessionsRoot(), '2026-09-25-0000beef');
+    await fs.mkdir(empty, { recursive: true });
+    const log = vi.spyOn(console, 'warn');
+    try {
+      resetSessionStoreForTests();
+      expect(await getSession('2026-09-25-0000beef')).toBeNull();
+      const lines = getLog().filter(entry => entry.message.includes('2026-09-25-0000beef')).map(entry => entry.message);
+      expect(lines, `an empty folder was reported as a session: ${lines.join(' | ')}`).toHaveLength(0);
+
+      // The same folder with history and no metadata is the case the sentence was written for.
+      await fs.writeFile(path.join(empty, 'events.jsonl'),
+        `${JSON.stringify({ seq: 1, kind: 'note', time: 1, source: 'app', message: { text: 'kept', chars: 4, truncated: false } })}\n`);
+      resetSessionStoreForTests();
+      await getSession('2026-09-25-0000beef');
+      expect(getLog().some(entry => entry.message.includes('2026-09-25-0000beef') && /meta\.json absent/.test(entry.message))).toBe(true);
+    } finally {
+      log.mockRestore();
+      await fs.rm(empty, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * A file where a session folder should be is an answer, not a refusal.
+   *
+   * Anything with a session-shaped name in the history folder is read as a session — a stray
+   * file somebody dropped there, a leftover from a copy. Opening `<that file>/meta.json` fails
+   * with ENOTDIR, which is not a filesystem refusing to cooperate: there is no projection under
+   * a file and never was. Reporting it as unreadable would stop the catalog from being cached
+   * for the life of the process because of one thing that is not a session at all.
+   */
+  it('reads a file sitting where a session folder would be as simply absent', async () => {
+    const present = await createSession({ title: 'real session', conversationId: 'stray-neighbour' });
+    await flushSessions();
+    const stray = path.join(sessionsRoot(), '2026-09-25-deadbeef');
+    await fs.writeFile(stray, 'not a session');
+    try {
+      resetRecorderForTests();
+      resetSessionStoreForTests();
+      expect((await findSessionByConversation('stray-neighbour', { requireUnique: true }))?.id).toBe(present.id);
+      expect(await getSession('2026-09-25-deadbeef')).toBeNull();
+    } finally {
+      await fs.rm(stray, { force: true });
+    }
+  });
+
+  /**
+   * The three answers metadata can give, told apart.
+   *
+   * `refusing to treat it as an empty session` named neither the file's state nor whether the
+   * validated checkpoint beside it was usable, so #393 could not be read as either "your
+   * meta.json was truncated" or "this machine would not let the app read it" — which are a
+   * restore and a lock, and nothing a reader does about one helps the other.
+   */
+  it('recovers a damaged projection from its checkpoint and refuses an unreadable one', async () => {
+    const session = await createSession({ title: 'damaged projection', conversationId: 'damaged-projection' });
+    await appendEvent(session.id, { time: 100, source: 'extension', kind: 'turn_start', turnId: 'work' });
+    await flushSessions();
+    await appendEvent(session.id, { time: 200, source: 'extension', kind: 'turn_end', turnId: 'work', outcome: 'completed' });
+    await flushSessions();
+    const folder = path.join(sessionsRoot(), session.id);
+    expect((await fs.stat(path.join(folder, 'meta.backup.json'))).size).toBeGreaterThan(0);
+
+    // Truncated bytes are the session's own damage, and the checkpoint is what it is for.
+    await fs.writeFile(path.join(folder, 'meta.json'), '{"id":"damaged-pro');
+    resetRecorderForTests();
+    resetSessionStoreForTests();
+    expect((await getSession(session.id))?.title).toBe('damaged projection');
+
+    // A refusal to read is not damage, and may not be answered as "no such session".
+    resetSessionStoreForTests();
+    const readFile = fs.readFile.bind(fs);
+    const spy = vi.spyOn(fs, 'readFile').mockImplementation((async (target, ...args) => {
+      if (String(target).startsWith(path.join(folder, 'meta'))) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      return readFile(target, ...args);
+    }) as typeof fs.readFile);
+    try {
+      await expect(getSession(session.id)).rejects.toThrow(/EACCES/);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  /**
+   * One unreadable folder may not outlive the moment it was unreadable.
+   *
+   * The catalog is built once and kept for the life of the process — it answers ownership,
+   * retention and the newest resumable handoff — so a folder dropped from one sweep used to be
+   * missing from every later answer too. That is the shape #393 reports: the chats came back
+   * after a restart, because only the restart rebuilt the catalog.
+   */
+  it('does not keep a catalog that lost a folder to a read failure', async () => {
+    const present = await createSession({ title: 'readable', conversationId: 'catalog-readable' });
+    const blocked = await createSession({ title: 'blocked', conversationId: 'catalog-blocked' });
+    await flushSessions();
+    resetRecorderForTests();
+    resetSessionStoreForTests();
+
+    const folder = path.join(sessionsRoot(), blocked.id);
+    const readFile = fs.readFile.bind(fs);
+    const spy = vi.spyOn(fs, 'readFile').mockImplementation((async (target, ...args) => {
+      if (String(target).startsWith(path.join(folder, 'meta'))) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      return readFile(target, ...args);
+    }) as typeof fs.readFile);
+    try {
+      expect(await findSessionByConversation('catalog-readable', { requireUnique: true })).not.toBeNull();
+      expect(await findSessionByConversation('catalog-blocked', { requireUnique: true })).toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
+
+    // The lock is gone, and so is the belief that the session was not there.
+    expect((await findSessionByConversation('catalog-blocked', { requireUnique: true }))?.id).toBe(blocked.id);
+    expect((await findSessionByConversation('catalog-readable', { requireUnique: true }))?.id).toBe(present.id);
+  });
+
+  /**
+   * The publishing rename may not outrun the bytes it publishes.
+   *
+   * `writeFile` then `rename` makes the *name* change atomically and says nothing about the
+   * contents: the entry can be in place while the data is still in the page cache, so an unclean
+   * shutdown in that window leaves a meta.json that exists and is empty — which is exactly the
+   * damage the recovery path above cannot undo, since a zero-length projection is no longer a
+   * projection of anything. Both the summary and the checkpoint it rotates are flushed first.
+   */
+  it('flushes a summary and its checkpoint before the rename that publishes them', async () => {
+    const steps: string[] = [];
+    const label = (file: unknown): string =>
+      String(file).includes('meta.backup.json') ? 'checkpoint' : String(file).includes('meta.json') ? 'summary' : '';
+    const open = fs.open.bind(fs);
+    const rename = fs.rename.bind(fs);
+    const openSpy = vi.spyOn(fs, 'open').mockImplementation((async (file, ...args) => {
+      const handle = await open(file as string, ...args as []);
+      const named = label(file);
+      if (named) {
+        const sync = handle.sync.bind(handle);
+        handle.sync = async () => { steps.push(`flush ${named}`); return sync(); };
+      }
+      return handle;
+    }) as typeof fs.open);
+    const renameSpy = vi.spyOn(fs, 'rename').mockImplementation((async (from, to) => {
+      if (label(to)) steps.push(`publish ${label(to)}`);
+      return rename(from as string, to as string);
+    }) as typeof fs.rename);
+    try {
+      const session = await createSession({ title: 'durable summary' });
+      await appendEvent(session.id, { time: 100, source: 'extension', kind: 'turn_start', turnId: 'work' });
+      await flushSessions();
+    } finally {
+      openSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
+    // The first write has no valid predecessor to keep; the second rotates one.
+    expect(steps.slice(0, 2)).toEqual(['flush summary', 'publish summary']);
+    expect(steps).toContain('flush checkpoint');
+    for (let i = 0; i < steps.length; i++) {
+      if (steps[i]!.startsWith('publish')) {
+        expect(steps.slice(0, i), `${steps[i]} was published unflushed`)
+          .toContain(`flush ${steps[i]!.slice('publish '.length)}`);
+      }
+    }
   });
 
   it.each([false, true])('keeps recovered replies in their original turn across bounded reads and legacy restart (%s)', async restart => {
@@ -2086,7 +2334,7 @@ describe('handoff storage', () => {
 
   it('asks for user-authoritative handoffs up to the documented 30k-token ceiling', () => {
     const prompt = nativeHandoffPrompt();
-    expect(prompt).toContain(HANDOFF_BRIEF_RULES);
+    expect(prompt).toContain(DEFAULT_HANDOFF_PROMPT);
     expect(prompt).toMatch(/user's messages as the highest-authority source/i);
     expect(prompt).toMatch(/10,000[–-]30,000 tokens/i);
     expect(prompt).toMatch(/~6,000-token brief is normally too short/i);
@@ -2097,6 +2345,17 @@ describe('handoff storage', () => {
     expect(prompt).toMatch(/FAILED \/ UNRESOLVED/i);
     expect(prompt).toMatch(/VERIFICATION/i);
     expect(prompt).toMatch(/completed and verified/i);
+  });
+
+  it('keeps continuation framing code-owned around an editable handoff prompt', () => {
+    const custom = 'CUSTOM HANDOFF POLICY: carry only the state needed for the next action.';
+    const prompt = nativeHandoffPrompt('abcdefghijklmnop', false, custom);
+    expect(prompt).toContain('[[CLF-HANDOFF:abcdefghijklmnop]]');
+    expect(prompt).toContain(custom);
+    expect(prompt).not.toContain(DEFAULT_HANDOFF_PROMPT);
+    expect(prompt).toContain('omit raw tool-call arguments and result bodies');
+    expect(prompt).toContain('Your reply to this message must be the brief itself and nothing else');
+    expect(prompt).toContain('no tool calls');
   });
 
   it('honors the tool-detail setting in the handoff brief without claiming to erase seen history', () => {
@@ -2476,8 +2735,9 @@ describe('canonical recorder 1.8', () => {
    * request id that starts after the reported end is proof the end was the page's, not
    * ChatGPT's. The recorder reopens the turn durably and lets the real end close it later.
    */
-  it('reopens a turn the page ended while its server turn kept calling tools', async () => {
-    const conversationId = 'conv-false-turn-end';
+  it.each(['completed', 'stopped', 'interrupted'] as const)('reopens a turn the page marked %s while its server turn kept calling tools', async outcome => {
+    const conversationId = `conv-false-turn-end-${outcome}`;
+    const sameRequest = `wfr_same_turn_${outcome}`, nextRequest = `wfr_next_turn_${outcome}`;
     const sessionId = await sessionForConversation(conversationId);
     const now = Date.now();
     const active = () => liveConversations().find((entry) => entry.conversationId === conversationId)?.activeTurnId ?? null;
@@ -2486,28 +2746,28 @@ describe('canonical recorder 1.8', () => {
       {
         kind: 'tool_evidence', time: now, fiberConversationId: conversationId,
         calls: [
-          { messageId: 'same-0', tool: 'read', order: 0, answered: false, requestId: 'wfr_same_turn' },
-          { messageId: 'next-0', tool: 'read', order: 1, answered: false, requestId: 'wfr_next_turn' }
+          { messageId: 'same-0', tool: 'read', order: 0, answered: false, requestId: sameRequest },
+          { messageId: 'next-0', tool: 'read', order: 1, answered: false, requestId: nextRequest }
         ]
       }
     ]);
-    await tool('wfr_same_turn', now + 10);
+    await tool(sameRequest, now + 10);
     expect(active()).toBe('g-false-end');
 
     await recordChatObservations(conversationId, [
-      { kind: 'turn_end', time: now + 20, turnId: 'g-false-end', outcome: 'completed' }
+      { kind: 'turn_end', time: now + 20, turnId: 'g-false-end', outcome }
     ]);
     expect(active()).toBeNull();
 
     // An in-flight call that merely finished late proves nothing about the end.
-    await tool('wfr_same_turn', now + 15);
+    await tool(sameRequest, now + 15);
     expect(active()).toBeNull();
     // Nor does a different server turn: that is a different turn.
-    await tool('wfr_next_turn', now + 30);
+    await tool(nextRequest, now + 30);
     expect(active()).toBeNull();
 
     // The same server turn calling on after the end is the turn not having ended.
-    await tool('wfr_same_turn', now + 40);
+    await tool(sameRequest, now + 40);
     expect(active()).toBe('g-false-end');
     const starts = await readEvents(sessionId!, { kinds: ['turn_start'] });
     expect(starts.map((event) => [event.turnId, event.source])).toEqual([
@@ -2517,7 +2777,7 @@ describe('canonical recorder 1.8', () => {
     expect(starts[1]?.kind === 'turn_start' && starts[1].detail).toMatch(/kept calling tools/);
 
     // Reopened once; the same turn going on is not news, and the real end is accepted.
-    await tool('wfr_same_turn', now + 50);
+    await tool(sameRequest, now + 50);
     expect(await readEvents(sessionId!, { kinds: ['turn_start'] })).toHaveLength(2);
     await recordChatObservations(conversationId, [
       { kind: 'turn_end', time: now + 60, turnId: 'g-false-end', outcome: 'completed' }
@@ -2525,6 +2785,42 @@ describe('canonical recorder 1.8', () => {
     expect(active()).toBeNull();
     const ends = await readEvents(sessionId!, { kinds: ['turn_end'] });
     expect(ends.map((event) => event.time)).toEqual([now + 20, now + 60]);
+  });
+
+  it.each(['continued-work', 'native-final'] as const)(
+    'reconciles a stopped response after recorder restart from %s', async evidenceKind => {
+    const conversationId = `conv-stop-restart-${evidenceKind}`;
+    const requestId = `wfr_stop_restart_${evidenceKind}`, turnId = 'stopped-before-restart';
+    const now = Date.now();
+    const { sessionId } = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: now, messageId: 'restart-question', text: 'Complete the task.' },
+      { kind: 'turn_start', time: now + 1, turnId },
+      { kind: 'tool_evidence', time: now + 2, turnId, fiberConversationId: conversationId,
+        calls: [{ messageId: 'restart-call', tool: 'read', order: 0, answered: false, requestId }] }
+    ]);
+    await tool(requestId, now + 3);
+    await recordChatObservations(conversationId, [{ kind: 'turn_end', time: now + 10, turnId, outcome: 'stopped' }]);
+    await flushSessions();
+    resetRecorderForTests();
+    resetSessionStoreForTests();
+    await sessionForConversation(conversationId);
+    // Restored exact request proof is supplied by a re-observed native call.
+    await recordChatObservations(conversationId, [{ kind: 'tool_evidence', time: now + 20, turnId,
+      fiberConversationId: conversationId,
+      calls: [{ messageId: 'restart-call', tool: 'read', order: 0, answered: true, requestId }] }]);
+    if (evidenceKind === 'continued-work') {
+      await tool(requestId, now + 21);
+      expect((await getSession(sessionId!))?.activeTurnId).toBe(turnId);
+    }
+    await recordChatObservations(conversationId, [{ kind: 'assistant_message', time: now + 30,
+      turnId, messageId: 'native-final-after-reload', providerMessageId: '11111111-2222-4333-8444-555555555555',
+      text: 'The full answer is available after reload.', state: 'final', final: true, activeNow: false }]);
+    const { readCompletedFinal } = await import('../src/main/session/store.js');
+    expect(await readCompletedFinal(sessionId!, conversationId, turnId))
+      .toMatchObject({ messageId: 'native-final-after-reload', turnId });
+    await tool(requestId, now + 31);
+    expect((await getSession(sessionId!))?.activeTurnId).toBeNull();
+    expect(await readCompletedFinal(sessionId!, conversationId, turnId)).not.toBeNull();
   });
 
   it('never cross-attributes concurrent same-tool calls from two chats', async () => {
@@ -2933,6 +3229,29 @@ describe('naming the chats this app opened', () => {
     expect((await listSessions()).find(row => row.id === session.id)?.title).toBe('Only my request');
     expect((await getSession(session.id))?.title).toBe('Only my request');
     expect(JSON.parse(await fs.readFile(metaPath, 'utf8')).titleSource).toBe('fallback');
+  });
+
+  it('keeps the complete sent prompt weight when the page later projects only authored user text', async () => {
+    const session = await createSession({ conversationId: 'wire-context-weight', title: 'Wire context weight' });
+    const authored = 'Inspect the project.';
+    const instructions = 'Internal executor guidance. '.repeat(500);
+    const wire = `[[COS_CONTEXT:${instructions.length}]]\n${instructions}\n[[/COS_CONTEXT]]\n\n${authored}`;
+    const wireTokens = estimateTokens(wire);
+    await upsertMessageEvent(session.id, {
+      kind: 'user_message', source: 'app', time: 100, messageId: 'wire-user', authoredText: authored,
+      wireTokenEstimate: wireTokens, message: { text: wire, chars: wire.length, truncated: false }
+    });
+    const before = (await getSession(session.id))!.contextTokens;
+    await upsertMessageEvent(session.id, {
+      kind: 'user_message', source: 'extension', time: 101, messageId: 'wire-user',
+      message: { text: authored, chars: authored.length, truncated: false }
+    });
+    const after = (await getSession(session.id))!.contextTokens;
+    const [stored] = await readEvents(session.id, { kinds: ['user_message'] });
+    expect(after).toBe(before);
+    expect(stored).toMatchObject({ kind: 'user_message', authoredText: authored, wireTokenEstimate: wireTokens,
+      message: { text: authored } });
+    expect(stored && eventTokens(stored)).toBeGreaterThan(estimateTokens(authored));
   });
 
   it('does not persist native file credentials in recorded artifact arguments', async () => {
@@ -3519,13 +3838,13 @@ describe('folding redrawn commentary', () => {
       message: { text, truncated: false, chars: text.length }
     }) as SessionEvent;
 
-  it('reconciles a stored Stop status from its exact stopped turn without moving or duplicating the row', () => {
+  it('keeps a Stop request truthful when the page reports stopped without a final answer', () => {
     const pending: SessionEvent = { ...progress(2, 'finish-release:stop-one', 'Stop requested. ChatGPT has not yet confirmed that generation stopped.'), source: 'app', turnId: 'stop-one' };
     const stopped: SessionEvent = { seq: 4, time: 4, source: 'extension', kind: 'turn_end', turnId: 'stop-one', outcome: 'stopped' };
     const rows = [pending, stopped];
     const folded = foldProgress(rows);
     expect(folded).toHaveLength(2);
-    expect(folded[0]).toMatchObject({ seq: 2, time: 2, progressId: 'finish-release:stop-one', turnId: 'stop-one', message: { text: 'Stopped. ChatGPT confirmed that generation stopped.', truncated: false } });
+    expect(folded[0]).toEqual(pending);
     expect(foldProgress(folded)).toEqual(folded);
     expect(pending.kind === 'progress' && pending.message.text).toContain('not yet confirmed');
   });
@@ -3622,4 +3941,14 @@ describe('activity windows', () => {
     // tick and the extension's thirty-second alarm floor.
     expect(CHAT_ACTIVE_MS - CHAT_SILENCE_MS).toBeGreaterThanOrEqual(60_000);
   });
+});
+
+it('ships the long-standing handoff brief rules as the editable default, unchanged', () => {
+  // Making the prompt editable must not quietly change Compact & Resume for everyone who never
+  // opens the editor: the default is the brief the app has always asked for.
+  expect(DEFAULT_HANDOFF_PROMPT).toContain('target roughly 10,000–30,000 tokens');
+  for (const heading of ['TASK —', 'USER SPECIFICATION —', 'CURRENT STATE —', 'DONE —', 'IN PROGRESS —', 'PLANNED / DECIDED —',
+    'FAILED / UNRESOLVED —', 'FILES —', 'VERIFICATION —', 'ENVIRONMENT —', 'NEXT —', 'DO NOT —']) {
+    expect(DEFAULT_HANDOFF_PROMPT, heading).toContain(heading);
+  }
 });

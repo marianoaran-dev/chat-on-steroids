@@ -25,6 +25,8 @@ let endpoint: McpEndpoint | null = null;
 /** Retain custody while draining so final shutdown can bound that same stop. */
 let drainingEndpoint: McpEndpoint | null = null;
 let pendingDisconnect: Promise<void> | null = null;
+/** All callers join one teardown, including final shutdown overtaking a stalled connect. */
+let pendingTeardown: Promise<void> | null = null;
 /** The Core tunnel. Also the only tunnel on the cloudflared and manual paths. */
 let tunnel: TunnelHandle | null = null;
 /** Independent optional tunnel lifetimes on the OpenAI path. */
@@ -33,6 +35,47 @@ const optionalTunnels = new Map<OptionalSurface, { handle: TunnelHandle | null; 
 const optionalSurfaces: OptionalSurface[] = ['desktop', 'plugins'];
 const optionalTunnelId = (settings: TunnelSettings, id: OptionalSurface): string =>
   (id === 'desktop' ? settings.desktopTunnelId : settings.pluginsTunnelId) ?? '';
+/**
+ * Says so when two connectors are configured on one Secure Tunnel ID.
+ *
+ * OpenAI's tunnel dispatches round-robin between every client registered on an ID, so two
+ * surfaces sharing one means every other call reaches the wrong connector — which answers
+ * `UNKNOWN_TOOL: This tool name is not in the current Plugins catalog` about a tool that exists
+ * and is published, on the surface next door.
+ *
+ * Measured and reported in #352: twenty consecutive Core `exec_command` calls with byte-identical
+ * payloads, ten succeeded and ten failed, alternating exactly, with the app's own log alternating
+ * `POST mcp/core` and `POST mcp/plugins` in step. Nothing about the failure names its cause —
+ * restarting the app, refreshing the connectors and using fresh chats all left it in place — so
+ * three people reached this the long way before anybody suspected the configuration.
+ *
+ * Only a warning: the IDs are the user's to choose, a tunnel they deliberately share is their
+ * business, and refusing to connect over it would be worse than a 50% failure they can now read
+ * the reason for. Ids are never logged.
+ */
+function warnOnSharedTunnelIds(settings: TunnelSettings): void {
+  const named: Array<[SurfaceId, string]> = [
+    ['core', settings.tunnelId ?? ''],
+    ['desktop', settings.desktopTunnelId ?? ''],
+    ['plugins', settings.pluginsTunnelId ?? '']
+  ];
+  const byId = new Map<string, SurfaceId[]>();
+  for (const [surface, id] of named) {
+    const trimmed = id.trim();
+    if (!trimmed) continue;
+    byId.set(trimmed, [...(byId.get(trimmed) ?? []), surface]);
+  }
+  for (const surfaces of byId.values()) {
+    if (surfaces.length < 2) continue;
+    logWarn(
+      `connection: ${surfaces.join(' and ')} are configured on the same Secure Tunnel ID. ` +
+        'OpenAI dispatches round-robin across every client on one ID, so roughly one call in ' +
+        `${surfaces.length} will reach the wrong connector and come back as UNKNOWN_TOOL for a tool ` +
+        'that exists. Give each connector its own tunnel ID.'
+    );
+  }
+}
+
 /** Core-affecting transport settings the current run actually started with. */
 let activeCoreTransport: Pick<TunnelSettings, 'kind' | 'tunnelId' | 'binaryPath' | 'profileEpoch'> | null = null;
 let status: ConnectionStatus = {
@@ -268,8 +311,12 @@ async function connectImpl(): Promise<void> {
         privacyScreenshots: live.ui.privacyScreenshots
       };
     });
+    if (shutdownRequested) {
+      await startedEndpoint.stop({ forceAfterMs: 30_000 }).catch(() => {});
+      return;
+    }
     endpoint = startedEndpoint;
-    if (shutdownRequested || generation !== connectionGeneration) {
+    if (generation !== connectionGeneration) {
       await disconnectImpl();
       return;
     }
@@ -319,12 +366,20 @@ async function connectImpl(): Promise<void> {
         }
       }
     });
+    if (shutdownRequested) {
+      // Final shutdown can finish without waiting for startup. A late handle still
+      // belongs to this attempt, and its transport must outlive the accepted drain.
+      await disconnectImpl(30_000);
+      await startedTunnel.stop().catch(() => {});
+      return;
+    }
     tunnel = startedTunnel;
-    if (shutdownRequested || generation !== connectionGeneration) {
+    if (generation !== connectionGeneration) {
       await disconnectImpl();
       return;
     }
 
+    warnOnSharedTunnelIds(config.tunnel);
     for (const id of optionalSurfaces) await startOptionalTunnel(id, generation, config.tunnel, apiKey);
   } catch (err) {
     if (shutdownRequested || generation !== connectionGeneration) {
@@ -382,6 +437,11 @@ async function startOptionalTunnel(
         });
       }
     });
+    if (shutdownRequested) {
+      await disconnectImpl(30_000);
+      await started.stop().catch(() => {});
+      return;
+    }
     // The serialized teardown owns retirement, including when Disconnect arrived
     // during startup. Keep the transport until its accepted responses drain.
     lifetime.handle = started;
@@ -461,7 +521,11 @@ export function applySettings(): Promise<void> {
   return enqueueLifecycle(async () => { await applySettingsImpl(); for (const surface of SURFACE_LIST) refreshPluginPublication(surface.id); });
 }
 
-async function disconnectImpl(endpointForceAfterMs?: number): Promise<void> {
+function disconnectImpl(endpointForceAfterMs?: number): Promise<void> {
+  return pendingTeardown ??= disconnectResources(endpointForceAfterMs).finally(() => { pendingTeardown = null; });
+}
+
+async function disconnectResources(endpointForceAfterMs?: number): Promise<void> {
   for (const surface of SURFACE_LIST) unpublishPluginSurface(surface.id);
   // Invalidate callbacks first; stopping a child can itself cause exit/health events.
   connectionGeneration += 1;
@@ -529,7 +593,9 @@ export function shutdownConnection(): Promise<void> {
   connectionGeneration += 1;
   // Do not enqueue the force deadline behind the ordinary drain it must bound.
   void drainingEndpoint?.stop({ forceAfterMs: 30_000 }).catch(() => {});
-  return enqueueLifecycle(() => disconnectImpl(30_000));
+  // Quit is terminal: it must not inherit an unfinished startup/keychain wait.
+  // Join the whole teardown if it is already running, not just its HTTP drain.
+  return disconnectImpl(30_000);
 }
 
 /** The running tunnel's own local health address, for the self-test. Null if none. */

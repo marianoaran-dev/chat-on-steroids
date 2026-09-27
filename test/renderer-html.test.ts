@@ -71,6 +71,23 @@ describe('captured ChatGPT rendered HTML', () => {
     expect(stale.querySelector('a')).toBeNull();
     expect(stale.textContent).toContain('[source link unavailable]');
   });
+  it('recovers a later hydrated occurrence when the same citation marker appears twice', () => {
+    const marker = '\uE200cite\uE202turn-repeat-search0\uE201';
+    const firstPrefix = 'First claim. ';
+    const middle = ' Later claim. ';
+    const secondStart = [...firstPrefix + marker + middle].length;
+    const source = firstPrefix + marker + middle + marker;
+    const capture = whole(
+      `<p>${firstPrefix}<span data-content-reference-start="${[...firstPrefix].length}" data-content-reference-end="${[...firstPrefix].length + [...marker].length}"></span>` +
+      `${middle}<span data-content-reference-start="${secondStart}" data-content-reference-end="${secondStart + [...marker].length}">` +
+      '<a href="https://example.com/later">Later source</a></span></p>'
+    );
+    const rendered = renderedMarkdown(source, capture);
+    expect([...rendered.querySelectorAll('a')].map(anchor => anchor.getAttribute('href'))).toEqual([
+      'https://example.com/later',
+      'https://example.com/later'
+    ]);
+  });
   it('shows exact uploaded-file citation names as text and omits missing or stale file references', () => {
     const marker = '\uE200filecite\uE202turn0file0\uE201';
     const source = 'See the plan. ' + marker + '\n\nContinue here.';
@@ -193,8 +210,10 @@ describe('a capture that could not be carried whole', () => {
     // The prose either side of the block is prose, not part of the box.
     const paragraphs = [...rendered.querySelectorAll('p')].map((node) => node.textContent);
     expect(paragraphs).toEqual(['Run the suite before pushing.', 'Then open a pull request.']);
-    expect(rendered.querySelector('button')).toBeNull();
-    expect(rendered.textContent).not.toContain('Copy');
+    expect(rendered.querySelectorAll('button')).toHaveLength(1);
+    expect(rendered.querySelector('.markdown-code .tool-output-header')?.textContent).toContain('Code');
+    expect(rendered.querySelector('.markdown-code .tool-copy')?.textContent).toBe('Copy');
+    expect(rendered.textContent).not.toContain('Edit');
   });
 
   it('shows the whole message as markdown rather than a cut capture ending inside a code box', () => {

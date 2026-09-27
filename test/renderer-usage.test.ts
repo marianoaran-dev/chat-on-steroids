@@ -15,6 +15,75 @@ const money = new Intl.NumberFormat(undefined, { style: 'currency', currency: 'U
 const usd = (value: number) => money.format(value);
 afterEach(() => { dom?.window.close(); vi.unstubAllGlobals(); vi.resetModules(); });
 
+it('chooses the week start from a weekday menu, keeps exact counts, and restores the weekday after reload', async () => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  const data: UsageOverview = { contextTokenCap: 256_000, tokens: 0, models: [], days: [], sessions: 1,
+    limits: [
+      { model: 'gpt-6-pro', scope: 'model', remaining: 123, remainingPercent: null, resetAt: null, windowSeconds: 604800, observedAt: Date.now() },
+      { model: 'deep_research', scope: 'feature', remaining: 250, remainingPercent: null, resetAt: null, windowSeconds: null, observedAt: Date.now() }
+    ],
+    messages: { through: new Date(2026, 8, 21, 12).getTime(), days: [
+      { date: '2026-09-19', gpt56: 1234, gpt6: 12 }, { date: '2026-09-20', gpt56: 10, gpt6: 3 }, { date: '2026-09-21', gpt56: 1, gpt6: 1 }
+    ] } };
+  const getUsage = vi.fn(async () => ({ ok: true, data }));
+  Object.assign(dom.window, { api: { getUsage, getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
+  const { initLanguage, setLanguage } = await import('../src/renderer/i18n.js'); initLanguage();
+  const usage = await import('../src/renderer/usage.js'); usage.initUsage();
+  const element = (id: string) => dom.window.document.getElementById(id)!;
+  const select = element('usageWeekStart') as HTMLSelectElement;
+  const chosen = () => select.selectedOptions[0]!.textContent;
+  const choose = (weekday: number) => { select.value = String(weekday); select.dispatchEvent(new dom.window.Event('change')); };
+  // Seven named choices, Monday first, instead of a button that cycles silently.
+  expect([...select.options].map(option => option.value)).toEqual(['1', '2', '3', '4', '5', '6', '0']);
+  expect(select.options[6]!.textContent).toBe('Since Sunday');
+  expect(element('usageMessages6').textContent).toBe('—');
+  await usage.refreshUsage();
+  expect(chosen()).toBe('Since Monday');
+  expect(element('usageMessages6').textContent).toBe('1');
+  expect(element('usageStatus').textContent).toBe('');
+  const quotas = element('usageLimits').textContent;
+  expect(quotas).toContain('123 remaining');
+  expect(quotas).toContain('250 remaining');
+  expect(element('usageMessageCounts').textContent).toContain('sent');
+  expect(element('usageMessageCounts').textContent).not.toContain('remaining');
+  choose(6);
+  expect(chosen()).toBe('Since Saturday');
+  expect(element('usageMessages6').textContent).toBe('16');
+  expect(element('usageMessages56').textContent).toBe((1245).toLocaleString('en')); // Never a rounded 1.2K.
+  expect(element('usageMessagePeriod').textContent).toContain(new Intl.DateTimeFormat(undefined, { dateStyle: 'short', timeStyle: 'short' }).format(new Date(2026, 8, 19)));
+  expect(select.title).toContain(element('usageMessagePeriod').textContent);
+  expect(element('usageLimits').textContent).toBe(quotas);
+  expect(dom.window.localStorage.getItem('cos.usage.weekStart')).toBe('6');
+  expect(getUsage).toHaveBeenCalledTimes(1);
+  setLanguage('ja');
+  expect(element('usageWeekStart')).toBe(select);
+  expect(chosen()).toContain('土曜日から');
+  expect(element('usageMessages6').textContent).toBe('16');
+  setLanguage('en');
+  choose(0);
+  expect(chosen()).toBe('Since Sunday');
+  expect(element('usageMessages6').textContent).toBe('4');
+  choose(1);
+  expect(element('usageMessages6').textContent).toBe('1');
+  expect(getUsage).toHaveBeenCalledTimes(1);
+  dom.window.localStorage.setItem('cos.usage.weekStart', '6');
+  vi.resetModules();
+  const restored = await import('../src/renderer/usage.js'); restored.initUsage(); await restored.refreshUsage();
+  expect((element('usageWeekStart') as HTMLSelectElement).value).toBe('6');
+  expect(element('usageMessages6').textContent).toBe('16');
+  expect(element('usageStatus').textContent).toBe('');
+});
+
+it.each(['7', '-1', '1.5', 'invalid', ''])('ignores invalid persisted weekday %j', async saved => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  dom.window.localStorage.setItem('cos.usage.weekStart', saved);
+  const { initUsage } = await import('../src/renderer/usage.js'); initUsage();
+  expect((dom.window.document.getElementById('usageWeekStart') as HTMLSelectElement).value).toBe('1');
+  expect(dom.window.document.getElementById('usageMessages6')!.textContent).toBe('—');
+});
+
 it('explains a pending background rebuild and replaces transport failure with a retryable status', async () => {
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document);
@@ -42,7 +111,7 @@ it.each([256_000, 400_000])('shows the calculated %i context cap and edits formu
     { model: 'gpt-5.6', reasoningEffort: 'high', assumed: true, tokens: 1e6 },
     { model: 'another-model', reasoningEffort: 'low', assumed: false, tokens: 1e6 }
   ];
-  const data: UsageOverview = { contextTokenCap, tokens: 2e6, models, days: [{ date: '2026-09-05', tokens: 2e6, models }], sessions: 1, limits: ['deep_research', 'file_upload', 'paste_text_to_file', 'image_gen'].map(model => ({ model, scope: 'feature', remaining: 3, remainingPercent: 50, resetAt: null, windowSeconds: null, observedAt: Date.now() })) };
+  const data: UsageOverview = { contextTokenCap, messages: { through: Date.now(), days: [] }, tokens: 2e6, models, days: [{ date: '2026-09-05', tokens: 2e6, models }], sessions: 1, limits: ['deep_research', 'file_upload', 'paste_text_to_file', 'image_gen'].map(model => ({ model, scope: 'feature', remaining: 3, remainingPercent: 50, resetAt: null, windowSeconds: null, observedAt: Date.now() })) };
   const getUsage = vi.fn(async () => ({ ok: true, data }));
   Object.assign(dom.window, { api: { getUsage, getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
   const { initUsage, refreshUsage } = await import('../src/renderer/usage.js');
@@ -92,7 +161,7 @@ it('shows the Sol picker alias rate and preserves an explicitly cleared rate aft
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
   const models = [{ model: 'gpt-5-6-thinking', reasoningEffort: 'high', assumed: false, tokens: 427245 }];
-  const data: UsageOverview = { contextTokenCap: 256_000, tokens: 427245, models, days: [{ date: '2026-09-07', tokens: 427245, models }], sessions: 1, limits: [] };
+  const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 427245, models, days: [{ date: '2026-09-07', tokens: 427245, models }], sessions: 1, limits: [] };
   const getUsage = vi.fn(async () => ({ ok: true, data }));
   Object.assign(dom.window, { api: { getUsage, getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
   const usage = await import('../src/renderer/usage.js');
@@ -115,7 +184,7 @@ it('combines equivalent recorded names in the table while keeping raw rate edits
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
   const models = ['5.6', 'gpt-5-6-thinking', 'gpt-5.6-sol'].map(model => ({ model, reasoningEffort: 'high', assumed: false, tokens: 1e6 }));
-  const data: UsageOverview = { contextTokenCap: 256_000, tokens: 3e6, models, days: [{ date: '2026-09-08', tokens: 3e6, models }], sessions: 1, limits: [] };
+  const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 3e6, models, days: [{ date: '2026-09-08', tokens: 3e6, models }], sessions: 1, limits: [] };
   const getUsage = vi.fn(async () => ({ ok: true, data }));
   Object.assign(dom.window, { api: { getUsage, getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
   const usage = await import('../src/renderer/usage.js'); usage.initUsage(); await usage.refreshUsage();
@@ -130,4 +199,35 @@ it('combines equivalent recorded names in the table while keeping raw rate edits
   expect(table().textContent).toContain(`${usd(0.96)} + unpriced`);
   expect(getUsage).toHaveBeenCalledTimes(1);
   expect(models[0]!.model).toBe('5.6');
+});
+
+it('draws token activity as a Monday-first calendar ending today, with labels and a legend', async () => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  const key = (ago: number) => { const date = new Date(); date.setDate(date.getDate() - ago); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`; };
+  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 1e6 }];
+  const days = [{ date: key(3), tokens: 1e6, models }, { date: key(0), tokens: 4e6, models: [{ ...models[0]!, tokens: 4e6 }] }]; // Oldest first, as the main process sends them.
+  const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 5e6, models, days, sessions: 1, limits: [] };
+  Object.assign(dom.window, { api: { getUsage: async () => ({ ok: true, data }), getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
+  const usage = await import('../src/renderer/usage.js'); usage.initUsage(); await usage.refreshUsage();
+  const heat = dom.window.document.getElementById('usageHeatmap')!;
+  const cells = [...heat.querySelectorAll('.heat-grid > .heat-cell')] as HTMLElement[];
+  // Twelve whole weeks; the slot for today sits in the last column at its weekday's row.
+  expect(cells).toHaveLength(12 * 7);
+  const todayRow = (new Date().getDay() + 6) % 7;
+  const today = cells[11 * 7 + todayRow]!;
+  expect(today.dataset.level).toBe('4');
+  expect(cells.slice(11 * 7 + todayRow + 1).every(cell => cell.classList.contains('is-future'))).toBe(true);
+  expect(cells.filter(cell => cell.dataset.level && cell.dataset.level !== '0')).toHaveLength(2);
+  const cellAt = (cell: HTMLElement) => [cell.style.gridRow, cell.style.gridColumn];
+  expect(cellAt(today)).toEqual([String(todayRow + 2), '13']);
+  expect([...heat.querySelectorAll('.heat-day')].map(label => label.textContent)).toEqual(['Mon', 'Wed', 'Fri', 'Sun']);
+  expect(heat.querySelectorAll('.heat-month').length).toBeGreaterThanOrEqual(2);
+  expect(heat.querySelector('.heat-legend')!.textContent).toBe('LessMore');
+  // The cost chart states its peak and its date range.
+  // Today is the peak day and the newest row of the daily breakdown.
+  const todayCost = dom.window.document.querySelector('.usage-breakdown tr:nth-child(2) td:last-child')!.textContent;
+  expect(dom.window.document.querySelector('.usage-bars-scale')!.textContent).toBe(todayCost);
+  expect(dom.window.document.querySelectorAll('.usage-bar.is-peak')).toHaveLength(1);
+  expect(dom.window.document.querySelectorAll('.usage-bars-axis > span')).toHaveLength(2);
 });

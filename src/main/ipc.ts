@@ -3,8 +3,11 @@ import { applyLoginStartup, supportsLoginStartup } from './window-lifecycle.js';
 import { appearanceSchema } from './appearance-schema.js';
 import { mergeAppearance } from '../shared/appearance.js';
 import { prepareSessionPrompt, prepareSkillFollowup } from './session/prompt.js';
-import { listSkills } from './skills.js';
+import { importSkillFile, importSkillPackage, listManagedSkills, listSkills, removeSkill } from './skills.js';
+import { checkGitHubSkillUpdates, importGitHubSkill, linkGitHubSkill, updateGitHubSkill } from './skill-github.js';
+import { SKILL_ID_PATTERN } from '../shared/skills.js';
 import { listSkillLibrary } from './skill-library.js';
+import { installRecommendedSkill, listRecommendedSkills } from './recommended-skills.js';
 import { noteChatOrigin } from './session/recorder.js';
 import { REASONING_EFFORTS } from '../shared/session.js';
 import { safeExternalLink } from '../shared/external-link.js';
@@ -13,7 +16,7 @@ import { getChatModels, startChatModelDiscovery, configureChatModelDiscovery } f
 import { releaseSessionFinish, requestSessionFinishGoal } from './session/finish.js';
 import { GOAL_MARKER_INSTRUCTION } from '../shared/goal-templates.js';
 import { validateInputImages } from './session/input-images.js';
-import { stageInputAttachment, type AttachmentSource } from './session/input-attachments.js';
+import { stageInputAttachment, stageInputAttachments, type AttachmentSource } from './session/input-attachments.js';
 import { recordDeliveredInput, recordedInputImage } from './session/input-history.js';
 import { UI_BASE_ZOOM, titleBarOverlayForTheme, windowBackgroundForTheme } from './window-layout.js';
 import { usageOverview } from './session/usage.js';
@@ -26,6 +29,9 @@ import { requestBrowserPreferences } from './browser-preferences.js';
 import { sendDesktopInput, cancelDesktopInput, retryQueuedInputBrowser } from './session/start-input.js';
 import { wakeBrowserUrl } from './browser-startup.js';
 import { registerPluginIpc } from './plugins-ipc.js';
+import { deletePet, importPet, loadPetAsset, petLibraryState, setPetEnabled, setPetFavorite } from './pet-library.js';
+import { petOverlayControlState, refreshPetOverlayActivities, refreshPetOverlayAppearance, setPetOverlayVisible } from './pet-overlay.js';
+import { pluginRefreshPublications } from './plugin-refresh.js';
 /**
  * IPC surface.
  *
@@ -49,16 +55,19 @@ import {
   type Config
 } from '../shared/types.js';
 import { MAX_GOAL_SYSTEM_PROMPT_CHARS } from '../shared/goal.js';
+import { MAX_HANDOFF_PROMPT_CHARS } from '../shared/handoff.js';
 import { applySettings, connect, disconnect, getStatus, onStatusChange } from './connection.js';
-import { effectiveCapabilities, getConfig, updateConfig, MAX_MCP_INSTRUCTIONS_CHARS } from './config.js';
+import { effectiveCapabilities, getConfig, updateConfig, MAX_MCP_INSTRUCTIONS_CHARS, browserBridgePortSchema } from './config.js';
+import { bridgePortSelection } from './bridge-ports.js';
 import { clearAllGoalSwitches, draftTaskPlan, listGoalModels, MODEL_PAGE_SIZE, retireGoalDrafts, goalBackendFor, goalSwitchFor, setGoalSwitchNow, setGoalReplyActiveNow, setGoalObjectiveNow } from './goal.js';
 import { forgetExposedSurface } from './mcp/server.js';
 import { runDiagnostics } from './diagnostics.js';
 import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from './logger.js';
 import { RESERVED_ROOT_NAMES, uniqueRootName, validateNewRoot, SandboxError, resolvePath } from './sandbox.js';
 import { addProject, getSessionProject, listProjects, projectWorkspace, removeProject } from './projects.js';
-import { createProjectEntry, listProjectDirectory, previewProjectFile, projectFileTarget, renameProjectEntry, saveProjectTextFile } from './project-files.js';
+import { createProjectEntry, listProjectDirectory, previewProjectFile, projectFileTarget, renameProjectEntry, revalidateProjectFileTarget, saveProjectTextFile } from './project-files.js';
 import { ProjectFileWatchSet } from './project-file-watcher.js';
+import { ProjectGitWatchSet, readProjectGitDiff, readProjectGitSnapshot } from './project-git.js';
 import { hasSecret, isEncryptionAvailable, secureStorageStatus, setSecret } from './secrets.js';
 import { setupApiKeySlot } from '../shared/setup-profile.js';
 import { addSetupProfile, removeSetupProfile, switchSetupProfile } from './setup-profiles.js';
@@ -66,6 +75,7 @@ import { bundledVersion, locateBinary } from './tunnel/locate.js';
 import { TUNNEL_ID_PATTERN } from './tunnel/index.js';
 import {
   bridgeStatus,
+  publishBridgePortChange,
   companionDiagnostics,
   sessionActivityExpiresAt,
   sessionInputActivity,
@@ -90,7 +100,8 @@ import {
   findSessionByConversation,
   readEvents,
   readRecentEvents,
-  readHandoff
+  readHandoff,
+  readToolEditReview
 } from './session/store.js';
 import { activeSessionId, forgetSession, onSessionChange } from './session/recorder.js';
 import { blockedChatIds, setChatBlocked } from './session/blocked-chats.js';
@@ -106,8 +117,13 @@ import {
 import { tokenPressure } from '../shared/session.js';
 import { forgetWorkspaceRoot, renameWorkspaceRoot } from './workspace.js';
 import { hostPlatformInfo } from './platform.js';
+import {
+  MAX_COMMAND_ALLOWLIST_RULES,
+  MAX_COMMAND_ALLOWLIST_RULE_CHARS,
+  validateCommandAllowlistRule
+} from '../shared/command-allowlist.js';
 import { openInPreferredBrowser } from './browser.js';
-import { markInstallOnQuit, onUpdateChange, updateStatus } from './update.js';
+import { manualDownloadUrl, markInstallOnQuit, onUpdateChange, updateStatus } from './update.js';
 import {
   getMacOSDesktopAccess,
   onMacOSDesktopAccessChange,
@@ -130,6 +146,14 @@ const capabilityPatch = z.object(
 const settingsPatch = z.object({
   capabilities: capabilityPatch,
   readOnly: z.boolean(),
+  commandAllowlist: z.object({
+    enabled: z.boolean(),
+    mode: z.enum(['allow', 'deny']).optional().default('allow'),
+    rules: z.array(z.string().max(MAX_COMMAND_ALLOWLIST_RULE_CHARS).superRefine((rule, ctx) => {
+      const message = validateCommandAllowlistRule(rule);
+      if (message) ctx.addIssue({ code: 'custom', message });
+    })).max(MAX_COMMAND_ALLOWLIST_RULES)
+  }),
   tunnel: z.object({
     profileId: z.string().max(64).optional(),
     profileEpoch: z.number().int().nonnegative().optional(),
@@ -157,6 +181,7 @@ const settingsPatch = z.object({
     finishAction: z.enum(['notify', 'goal']).optional(),
     finishLeadMinutes: z.number().int().min(3).max(5).optional(),
     backgroundChats: z.boolean().optional(),
+    browserBridgePort: browserBridgePortSchema.optional(),
     browserOnly: z.boolean().optional(),
     autoRefreshPlugins: z.boolean().optional(),
     tabsToKeepOpen: z.number().int().min(1).max(50).optional(),
@@ -176,7 +201,8 @@ const settingsPatch = z.object({
     auto: z.boolean(),
     // Floored well above what a fresh chat holds, so a threshold cannot be set somewhere
     // every conversation is already past the moment it opens.
-    autoTokens: z.number().int().min(10_000).max(4_000_000)
+    autoTokens: z.number().int().min(10_000).max(4_000_000),
+    handoffPrompt: z.string().trim().min(1).max(MAX_HANDOFF_PROMPT_CHARS)
   }),
   multiAgent: z.object({
     enabled: z.boolean(),
@@ -184,7 +210,8 @@ const settingsPatch = z.object({
     defaultReasoning: z.enum(['', ...REASONING_EFFORTS]).optional(),
     maxWorkers: z.number().int().min(1).max(8),
     allowUnattributedCalls: z.boolean(),
-    recoverAgentTabs: z.boolean()
+    recoverAgentTabs: z.boolean(),
+    waitForSubAgents: z.boolean().optional()
   }),
   mcp: z.object({ instructions: z.string().trim().max(MAX_MCP_INSTRUCTIONS_CHARS) }).strict().optional(),
   goal: z.object({
@@ -250,6 +277,8 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
     throw new Error('Setup profile changed. Edit the tunnel ID in the selected profile again.');
   }
   const pick = <T>(live: T, before: T, next: T): T => (Object.is(before, next) ? live : next);
+  const pickRules = (live: string[], before: string[], next: string[]): string[] =>
+    before.length === next.length && before.every((rule, index) => rule === next[index]) ? live : next;
   const capabilities = Object.fromEntries(
     CAPABILITIES.map((capability) => [
       capability,
@@ -260,6 +289,11 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
     mcp: wanted.mcp ? { instructions: pick(current.mcp.instructions, base.mcp?.instructions ?? '', wanted.mcp.instructions) } : current.mcp,
     capabilities,
     readOnly: pick(current.readOnly, base.readOnly, wanted.readOnly),
+    commandAllowlist: {
+      enabled: pick(current.commandAllowlist.enabled, base.commandAllowlist.enabled, wanted.commandAllowlist.enabled),
+      mode: pick(current.commandAllowlist.mode, base.commandAllowlist.mode, wanted.commandAllowlist.mode),
+      rules: pickRules(current.commandAllowlist.rules, base.commandAllowlist.rules, wanted.commandAllowlist.rules)
+    },
     tunnel: {
       ...current.tunnel,
         pluginsTunnelId: wanted.tunnel.pluginsTunnelId === undefined ? current.tunnel.pluginsTunnelId ?? ''
@@ -283,6 +317,8 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       finishAction: pick(current.ui.finishAction, base.ui.finishAction, wanted.ui.finishAction),
       finishLeadMinutes: pick(current.ui.finishLeadMinutes, base.ui.finishLeadMinutes, wanted.ui.finishLeadMinutes),
       backgroundChats: pick(current.ui.backgroundChats, base.ui.backgroundChats, wanted.ui.backgroundChats),
+      browserBridgePort: wanted.ui.browserBridgePort === undefined ? current.ui.browserBridgePort
+        : pick(current.ui.browserBridgePort ?? 'auto', base.ui.browserBridgePort ?? 'auto', wanted.ui.browserBridgePort),
       browserOnly: pick(current.ui.browserOnly, base.ui.browserOnly, wanted.ui.browserOnly),
       autoRefreshPlugins: pick(current.ui.autoRefreshPlugins, base.ui.autoRefreshPlugins, wanted.ui.autoRefreshPlugins),
       tabsToKeepOpen: pick(current.ui.tabsToKeepOpen, base.ui.tabsToKeepOpen, wanted.ui.tabsToKeepOpen),
@@ -308,7 +344,12 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
     },
     compaction: {
       auto: pick(current.compaction.auto, base.compaction.auto, wanted.compaction.auto),
-      autoTokens: pick(current.compaction.autoTokens, base.compaction.autoTokens, wanted.compaction.autoTokens)
+      autoTokens: pick(current.compaction.autoTokens, base.compaction.autoTokens, wanted.compaction.autoTokens),
+      handoffPrompt: pick(
+        current.compaction.handoffPrompt,
+        base.compaction.handoffPrompt,
+        wanted.compaction.handoffPrompt
+      )
     },
     multiAgent: {
       defaultModel: pick(current.multiAgent.defaultModel, base.multiAgent.defaultModel, wanted.multiAgent.defaultModel),
@@ -324,6 +365,11 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
         current.multiAgent.recoverAgentTabs,
         base.multiAgent.recoverAgentTabs,
         wanted.multiAgent.recoverAgentTabs
+      ),
+      waitForSubAgents: pick(
+        current.multiAgent.waitForSubAgents,
+        base.multiAgent.waitForSubAgents,
+        wanted.multiAgent.waitForSubAgents
       )
     },
     goal: {
@@ -375,6 +421,9 @@ async function buildState(): Promise<AppState> {
   return {
     config,
     status: getStatus(),
+    connectorSchemas: Object.fromEntries(
+      pluginRefreshPublications().map(({ surface, schemaId }) => [surface, schemaId])
+    ),
     platform: hostPlatformInfo(),
     loginStartupAvailable: supportsLoginStartup(process.platform, app.isPackaged),
     secureStorage: await secureStorageStatus(),
@@ -416,6 +465,17 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     if (!target || target !== watchedWindow || target.isDestroyed() || target.webContents.isDestroyed()) return;
     target.webContents.send('projectFiles:changed', event);
   });
+  const projectGitWatches = new ProjectGitWatchSet(event => {
+    const target = getWindow();
+    if (!target || target !== watchedWindow || target.isDestroyed() || target.webContents.isDestroyed()) return;
+    target.webContents.send('projectGit:changed', event);
+  });
+  let projectWatchRequest = 0;
+  const closeProjectWatches = (): void => {
+    projectWatchRequest++;
+    projectFileWatches.close();
+    projectGitWatches.close();
+  };
   handle('setup:profile', async payload => {
     const request = z.discriminatedUnion('action', [
       z.object({ action: z.literal('add'), name: z.string().trim().min(1).max(80) }),
@@ -432,7 +492,6 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     });
     return buildState();
   });
-  registerPluginIpc(handle, getWindow);
   handle('usage:get', () => usageOverview());
   handle('state:get', async () => {
     const state = await buildState();
@@ -447,6 +506,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     const request = settingsSave.parse(payload);
     const before = getConfig();
     const next = await updateConfig(async config => {
+      if (request.patch.ui.browserBridgePort !== undefined &&
+          request.patch.ui.browserBridgePort !== (request.base.ui.browserBridgePort ?? 'auto') &&
+          bridgePortSelection().overridden) {
+        throw new Error('Browser bridge port is controlled by CLF_BRIDGE_PORTS.');
+      }
       const proposed = { ...config, ...mergeSettings(config, request.base, request.patch) };
       // If an earlier Off retirement failed, On must retry it before admission.
       if (!config.ui.finishTool && proposed.ui.finishTool) await cancelFinishInputs(false);
@@ -455,7 +519,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     }, async (published, previous) => {
       if (previous.ui.finishTool && !published.ui.finishTool) await cancelFinishInputs(false);
       else if ((previous.goal.impulseMinutes ?? 0) > 0 && !published.goal.impulseMinutes) await cancelFinishInputs(true);
-    });
+    }, publishBridgePortChange);
     // Renderer palette changes are immediate, so keep OS/Electron-owned chrome in lock-step too.
     // Without this, selecting Dark on macOS left the title bar, menus and file picker in the
     // system theme until restart (and startup still defaulted to system before index.ts applies it).
@@ -466,6 +530,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     // live theme switch an old opposite background otherwise flashes behind the renderer while it
     // paints again. This is also the color Electron shows during any later renderer reload/failure.
     getWindow()?.setBackgroundColor(windowBackgroundForTheme(next.ui.theme, next.ui.appearance));
+    refreshPetOverlayAppearance();
     if (
       before.goal.enabled !== next.goal.enabled ||
       // The mode is authority too: a draft started as a gate must not be typed after the user
@@ -566,7 +631,82 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
 
   handle('projects:list', () => listProjects());
+  handle('pets:list', async () => petLibraryState());
+  handle('pets:overlayState', async () => petOverlayControlState());
+  handle('pets:overlayVisible', async payload => {
+    const { visible } = z.object({ visible: z.boolean() }).strict().parse(payload);
+    return setPetOverlayVisible(visible);
+  });
+  handle('pets:import', async () => {
+    const options: Electron.OpenDialogOptions = { title: 'Import CoS Pet folder', properties: ['openDirectory'] };
+    const owner = getWindow();
+    const selected = owner && !owner.isDestroyed()
+      ? await dialog.showOpenDialog(owner, options)
+      : await dialog.showOpenDialog(options);
+    if (selected.canceled || !selected.filePaths[0]) return null;
+    return importPet(selected.filePaths[0]);
+  });
+  handle('pets:enabled', async payload => {
+    const { id, enabled } = z.object({ id: z.string().min(1).max(100), enabled: z.boolean() }).strict().parse(payload);
+    const state = setPetEnabled(id, enabled);
+    // Enabling shows the overlay, without restoring other pets dismissed for this run.
+    if (enabled) await setPetOverlayVisible(true, false);
+    return state;
+  });
+  handle('pets:favorite', async payload => {
+    const { id, favorite } = z.object({ id: z.string().min(1).max(100), favorite: z.boolean() }).strict().parse(payload);
+    return setPetFavorite(id, favorite);
+  });
+  handle('pets:delete', async payload => {
+    const { id } = z.object({ id: z.string().min(1).max(100) }).strict().parse(payload);
+    return deletePet(id);
+  });
+  handle('pets:asset', async payload => {
+    const { id, preview } = z.object({ id: z.string().min(1).max(100), preview: z.boolean() }).strict().parse(payload);
+    return loadPetAsset(id, preview);
+  });
   handle('skills:list', () => listSkills());
+  handle('skills:managed', () => listManagedSkills());
+  handle('skills:recommended', () => listRecommendedSkills());
+  handle('skills:installRecommended', async payload => {
+    const { id } = z.object({ id: z.string().regex(SKILL_ID_PATTERN) }).strict().parse(payload);
+    return installRecommendedSkill(id);
+  });
+  handle('skills:import', async payload => {
+    const { kind } = z.object({ kind: z.enum(['folder', 'file']) }).strict().parse(payload);
+    const options: Electron.OpenDialogOptions = kind === 'folder'
+      ? { title: 'Import Skill folder', properties: ['openDirectory'] }
+      : { title: 'Import SKILL.md', properties: ['openFile'], filters: [{ name: 'Markdown skills', extensions: ['md'] }] };
+    const owner = getWindow();
+    const selected = owner && !owner.isDestroyed()
+      ? await dialog.showOpenDialog(owner, options)
+      : await dialog.showOpenDialog(options);
+    if (selected.canceled || !selected.filePaths[0]) return null;
+    if (kind === 'folder') await importSkillPackage(selected.filePaths[0]);
+    else await importSkillFile(selected.filePaths[0]);
+    return listManagedSkills();
+  });
+  handle('skills:githubImport', async payload => {
+    const { url } = z.object({ url: z.string().trim().min(1).max(2048) }).strict().parse(payload);
+    return importGitHubSkill(url);
+  });
+  handle('skills:githubLink', async payload => {
+    const { id, url } = z.object({ id: z.string().regex(SKILL_ID_PATTERN), url: z.string().trim().min(1).max(2048) }).strict().parse(payload);
+    return linkGitHubSkill(id, url);
+  });
+  handle('skills:githubCheck', async payload => {
+    const { id } = z.object({ id: z.string().regex(SKILL_ID_PATTERN) }).strict().parse(payload);
+    return checkGitHubSkillUpdates(id);
+  });
+  handle('skills:githubUpdate', async payload => {
+    const { id } = z.object({ id: z.string().regex(SKILL_ID_PATTERN) }).strict().parse(payload);
+    return updateGitHubSkill(id, directory => shell.trashItem(directory));
+  });
+  handle('skills:remove', async payload => {
+    const { id } = z.object({ id: z.string().regex(SKILL_ID_PATTERN) }).strict().parse(payload);
+    await removeSkill(id, directory => shell.trashItem(directory));
+    return listManagedSkills();
+  });
   handle('skills:library', async payload => {
     const scope = z.object({ sessionId: z.string().min(1).max(80).nullable().optional(), projectId: z.string().uuid().nullable().optional() }).strict().parse(payload ?? {});
     const folder = () => scope.sessionId ? getSessionProject(scope.sessionId)
@@ -650,19 +790,40 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('projectFiles:watch', async payload => {
     const { projectId, directories } = z.object({ projectId: projectFileId.nullable(), directories: z.array(projectRelativePath).max(128) }).strict().parse(payload);
     const target = getWindow();
-    if (!target || target.isDestroyed()) { projectFileWatches.close(); return false; }
+    if (!target || target.isDestroyed()) { closeProjectWatches(); return false; }
     if (target !== watchedWindow) {
-      projectFileWatches.close();
+      closeProjectWatches();
       watchedWindow = target;
       target.webContents.once('destroyed', () => {
-        if (watchedWindow === target) { watchedWindow = null; projectFileWatches.close(); }
+        if (watchedWindow === target) { watchedWindow = null; closeProjectWatches(); }
       });
       target.webContents.on('did-start-loading', () => {
-        if (watchedWindow === target) projectFileWatches.close();
+        if (watchedWindow === target) closeProjectWatches();
       });
     }
+    const request = ++projectWatchRequest;
     await projectFileWatches.sync(projectId, projectId ? directories : []);
-    return true;
+    if (request !== projectWatchRequest || watchedWindow !== target) return false;
+    await projectGitWatches.sync(projectId);
+    return request === projectWatchRequest && watchedWindow === target;
+  });
+  handle('projectGit:snapshot', async payload => {
+    const { projectId, baseRef } = z.object({ projectId: projectFileId,
+      baseRef: z.string().min(1).max(256).optional() }).strict().parse(payload);
+    return readProjectGitSnapshot(projectId, baseRef);
+  });
+  handle('projectGit:diff', async payload => {
+    const { projectId, path, baseRef, expectedRevision } = z.object({ projectId: projectFileId, path: projectRelativePath.min(1),
+      baseRef: z.string().min(1).max(256).optional(), expectedRevision: z.string().length(64).regex(/^[0-9a-f]+$/).optional() }).strict().parse(payload);
+    return readProjectGitDiff(projectId, path, baseRef, expectedRevision);
+  });
+  handle('sessions:toolEditReview', async payload => {
+    const { sessionId, callId, changeIndex } = z.object({
+      sessionId: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i),
+      callId: z.string().uuid(),
+      changeIndex: z.number().int().min(0).max(63)
+    }).strict().parse(payload);
+    return readToolEditReview(sessionId, callId, changeIndex);
   });
   handle('projectFiles:preview', async payload => {
     const { projectId, path } = z.object({ projectId: projectFileId, path: projectRelativePath.min(1) }).strict().parse(payload);
@@ -687,6 +848,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     const { projectId, path } = z.object({ projectId: projectFileId, path: projectRelativePath.min(1) }).strict().parse(payload);
     const target = await projectFileTarget(projectId, path, { allowRoot: false });
     if (target.kind !== 'file' && target.kind !== 'directory') throw new Error('Only regular files and folders can be deleted');
+    await revalidateProjectFileTarget(target);
     await shell.trashItem(target.real);
     return true;
   });
@@ -804,6 +966,14 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     return true;
   });
 
+  // "Get update" for an installation that cannot update itself: the exact published file for
+  // this machine and the announced version, opened in the user's browser. The renderer names
+  // nothing; the URL is built here from the checked release and this process's platform.
+  handle('update:download', async () => {
+    await shell.openExternal(manualDownloadUrl(updateStatus().latest));
+    return true;
+  });
+
   handle('link:open', async (payload) => {
     const { url } = z.object({ url: z.string().max(8192) }).parse(payload);
     if (!ALLOWED_LINKS.has(url) && !safeExternalLink(url)) throw new Error('That link is not allowed');
@@ -905,9 +1075,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
 
   const stageFiles = async (sources: AttachmentSource[]) => {
     const retained = new Set((await listInputs()).filter(row => !['sent', 'failed', 'cancelled'].includes(row.state)).flatMap(row => row.attachments?.map(file => file.id) ?? []));
-    const result = [];
-    for (const source of sources) result.push(await stageInputAttachment(source, retained));
-    return result;
+    return stageInputAttachments(sources, retained);
   };
   handle('sessions:files', async () => {
     const chosen = await dialog.showOpenDialog({ title: 'Attach files', properties: ['openFile', 'multiSelections'] });
@@ -1028,6 +1196,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     // A blocked worker chat frees its swarm slot now, not on the next 30-second pass: the
     // user pressing Block on a worker is usually about to start something in its place.
     if (blocked) await sweepStaleSwarm().catch(() => undefined);
+    refreshPetOverlayActivities();
     return blockedChatIds();
   });
 
@@ -1213,6 +1382,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   };
   onStatusChange(pushState);
   onBridgeChange(pushState);
+  registerPluginIpc(handle, getWindow, pushState);
   // Draft stages belong to session controls; state:changed only refreshes settings.
   onGoalChange(() => push('session:changed'));
   handle('tasks:cancel', async payload => cancelTaskRequest(z.object({ requestId: z.string().uuid() }).parse(payload).requestId));

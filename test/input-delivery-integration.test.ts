@@ -23,7 +23,7 @@ vi.mock('electron', () => ({
     decryptStringAsync: async (data: Buffer) => ({ result: data.toString(), shouldReEncrypt: false })
   }
 }));
-vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd() }));
+vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd(), shippedExtensionBuild: () => null, extensionUpdateOffer: () => null, prepareExtensionUpdate: () => null }));
 vi.mock('../src/main/connection.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/main/connection.js')>();
   return { ...actual, connect: async () => {}, getStatus: () => ({ ...actual.getStatus(), state: 'connected' }) };
@@ -128,7 +128,74 @@ it('keeps automatic Continue attached to the native question after injected corr
   } finally { clock.mockRestore(); }
 });
 
-it.each([false, true])('retires Goal only when queued input commits its exact source, including restored aliases (%s)', async alias => {
+/**
+ * The reason a recovery message could not be sent, kept instead of dropped.
+ *
+ * A Continue that was never authorized is still owed, so `releaseRecoveryClaim` hands the ticket back
+ * to the queue on purpose and keeps its pickup budget. What went with it was the explanation: the page
+ * tells the app exactly why it could not send, `failBrowserInput` receives that string, and this one
+ * branch was the only one that discarded it — every other branch there stores it as `error`.
+ *
+ * Measured on 2026-09-26: one recovery row claimed twelve times in three minutes, back to `queued`
+ * every time, with no `error` on the receipt and not a single line in the log. The loop was visible
+ * only because the *claims* are logged; the reason for the release was nowhere.
+ */
+it('keeps the reason a recovery claim was released, and says it once', async () => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const bridge = await import('../src/main/bridge.js');
+    const { getLog } = await import('../src/main/logger.js');
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false } });
+    const conversationId = randomUUID(), turnId = randomUUID(), questionId = randomUUID();
+    const session = await createSession({ title: 'Released recovery claim', conversationId });
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'user_message', messageId: questionId, text: 'Finish the task', time: now },
+      { kind: 'turn_start', turnId, time: now }
+    ] });
+    await attributedMcp(conversationId);
+    now += 120_000;
+    await bridge.sweepStaleSwarm(now);
+    const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs
+      .find((item: any) => item.conversationId === conversationId);
+    expect(repair?.reason, 'no silence repair, so no recovery row to release').toBe('silence');
+    expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+    await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+    const row = (await input.listInputs()).find(item => item.sessionId === session.id && item.recovery)!;
+    expect(row, 'no recovery row was filed').toBeTruthy();
+
+    expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+    const reason = 'The composer refused the prepared text.';
+    expect(await input.failBrowserInput(row.id, 'a-document', reason)).toBe(true);
+
+    // The ticket survives — that is the point of releasing rather than failing it — and now it
+    // carries why it came back.
+    const released = (await input.listInputs()).find(item => item.id === row.id)!;
+    expect(released.state, 'the ticket was not handed back to the queue').toBe('queued');
+    expect(released.owner).toBeNull();
+    expect(released.error, 'the reason the browser gave was discarded').toBe(reason);
+
+    const said = getLog().filter(entry => entry.message.includes('could not send this recovery message'));
+    expect(said, 'the release was not reported at all').toHaveLength(1);
+    expect(said[0]!.message).toContain(reason);
+
+    // Said once per reason, not once per attempt: the schedule re-offers the same ticket in seconds.
+    expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+    expect(await input.failBrowserInput(row.id, 'a-document', reason)).toBe(true);
+    expect(getLog().filter(entry => entry.message.includes('could not send this recovery message')),
+      'it repeated itself once per attempt').toHaveLength(1);
+
+    // A different reason is new information and is said.
+    expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+    expect(await input.failBrowserInput(row.id, 'a-document', 'The tab moved to another chat.')).toBe(true);
+    expect(getLog().filter(entry => entry.message.includes('could not send this recovery message'))).toHaveLength(2);
+  } finally { clock.mockRestore(); }
+});
+
+it.each([
+  { model: 'gpt-5.6-sol', alias: false }, { model: 'gpt-5.6-sol', alias: true },
+  { model: 'gpt-6-pro', alias: false }, { model: 'gpt-6-pro', alias: true }
+])('retires Goal only when queued input commits its exact source ($model, restored alias: $alias)', async ({ model, alias }) => {
   const store = await import('../src/main/session/store.js');
   const durable = await import('../src/main/durable.js');
   let now = Date.now();
@@ -142,7 +209,7 @@ it.each([false, true])('retires Goal only when queued input commits its exact so
     const row = await input.enqueueInput({ ...message(session.id, 'off'), automation: undefined, mode: 'after-turn' });
     now += 10;
     await post('/events', { conversationId, events: [
-      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'model_selection', model, time: now },
       { kind: 'turn_start', turnId: 'queue-source', time: now },
       { kind: 'assistant_message', turnId: 'queue-source', messageId: 'queue-source-answer', text: 'Current result', state: 'final', final: true, time: now + 1 },
       { kind: 'turn_end', turnId: 'queue-source', outcome: 'completed', time: now + 2 }
@@ -252,6 +319,84 @@ it.each([false, true])('collects an exact recorded helper final across document 
     await expect(answer).resolves.toBe('{"next":"continue"}');
     expect(await input.pendingBrowserInputs()).toEqual([]);
   } finally { controller.abort(); await answer.catch(() => undefined); }
+});
+
+it.each([
+  { mode: 'auto', earlyEnd: false }, { mode: 'after-turn', earlyEnd: false }, { mode: 'finish', earlyEnd: false },
+  { mode: 'auto', earlyEnd: true }, { mode: 'after-turn', earlyEnd: true }, { mode: 'finish', earlyEnd: true }
+] as const)('delivers $mode queued during a delayed report of the current final (early end: $earlyEnd)', async ({ mode, earlyEnd }) => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const conversationId = randomUUID(), turnId = randomUUID();
+    const session = await createSession({ title: 'Delayed final and follow-up', conversationId });
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'user_message', messageId: randomUUID(), text: 'Inspect the current task', time: now },
+      { kind: 'turn_start', turnId, time: now }
+    ] });
+    await attributedMcp(conversationId);
+    const completedAt = now + 1000;
+    now += 2000;
+    if (earlyEnd) {
+      await post('/events', { conversationId, events: [{ kind: 'turn_end', turnId, outcome: 'completed', time: completedAt }] });
+      // A UI end without its final retains the same exact MCP-backed work grant.
+      expect(await input.sessionInputPolicy(session.id)).toMatchObject({ canInject: true, injectionTurnId: turnId, settled: false });
+    }
+    // The browser has finished, but its journal has not reached the app yet.
+    expect((await getSession(session.id))?.activeTurnId).toBe(earlyEnd ? null : turnId);
+    const row = await input.enqueueInput({ ...message(session.id, 'off'), mode });
+    const next = mode === 'auto' ? null : await input.enqueueInput({ ...message(session.id, 'off'), mode, text: 'A later checkpoint' });
+    expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(false);
+    const finalEvents = [
+      { kind: 'assistant_message', turnId, messageId: randomUUID(), text: 'The task is complete.',
+        state: 'final', final: true, activeNow: true, time: completedAt },
+      { kind: 'turn_end', turnId, outcome: 'completed', time: completedAt }
+    ];
+    await post('/events', { conversationId, events: finalEvents });
+    expect(await input.sessionInputPolicy(session.id)).toMatchObject({ browserAllowed: true, settled: true });
+    input.resetInputForTests();
+    expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(true);
+    expect((await input.listInputs()).find(item => item.id === row.id)?.queuedTurn).toEqual({ conversationId, turnId });
+    const { trackInFlight, emptyEvidence } = await import('../src/main/mcp/call-context.js');
+    await trackInFlight({ startedAt: now, transportKey: null, agent: null, outcome: null, evidence: emptyEvidence(),
+      caller: { requestId: randomUUID(), transportKey: null, conversationId } }, async () => {
+      expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(false);
+      expect(await input.claimBrowserInput(row.id, 'running-tool-document', conversationId, true)).toBeNull();
+    });
+    const claim = await input.claimBrowserInput(row.id, 'followup-document', conversationId, true);
+    expect(claim?.id).toBe(row.id);
+    expect(claim?.completedTurnId).toBe(turnId);
+    expect(await input.authorizeBrowserInput(row.id, 'followup-document', conversationId)).toBe(true);
+    expect(await input.authorizeBrowserInput(row.id, 'followup-document', conversationId)).toBe(false);
+    expect(await input.acknowledgeBrowserInput(row.id, 'followup-document', conversationId, randomUUID())).toBe(true);
+    await post('/events', { conversationId, events: finalEvents });
+    input.resetInputForTests();
+    expect((await input.pendingBrowserInputs()).some(item => item.id === row.id || item.id === next?.id)).toBe(false);
+    if (next) expect((await input.listInputs()).find(item => item.id === next.id)?.state).toBe('queued');
+  } finally { clock.mockRestore(); }
+});
+
+it.each(['after-turn', 'finish'] as const)('does not release %s queued after the answer was already recorded, including replay', async mode => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const conversationId = randomUUID(), turnId = randomUUID();
+    const session = await createSession({ title: 'Already completed queue boundary', conversationId });
+    const events = [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'user_message', messageId: randomUUID(), text: 'Original question', time: now },
+      { kind: 'turn_start', turnId, time: now },
+      { kind: 'assistant_message', turnId, messageId: randomUUID(), text: 'Already complete.', state: 'final', final: true, time: now },
+      { kind: 'turn_end', turnId, outcome: 'completed', time: now }
+    ];
+    await post('/events', { conversationId, events });
+    now += 2000;
+    const row = await input.enqueueInput({ ...message(session.id, 'off'), mode });
+    expect(row.queuedTurn).toBeUndefined();
+    await post('/events', { conversationId, events });
+    input.resetInputForTests();
+    expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(false);
+    expect(await input.claimBrowserInput(row.id, 'old-answer-document', conversationId, true)).toBeNull();
+  } finally { clock.mockRestore(); }
 });
 
 it('does not pin an idle chat to tool transport because another call is unattributed', async () => {
@@ -1363,8 +1508,8 @@ describe('IPC input delivery and Goal control integration', () => {
   });
   it('requires an exact plugin claim and matching schema before a refresh completion', async () => {
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: true } });
-    const { publishPluginSurface, resetPluginRefreshForTests } = await import('../src/main/plugin-refresh.js');
-    resetPluginRefreshForTests();
+    const { publishPluginSurface, resetPluginRefreshForTests, setPluginRefreshTunnelGraceForTests } = await import('../src/main/plugin-refresh.js');
+    resetPluginRefreshForTests(); setPluginRefreshTunnelGraceForTests(0);
     const tools = [{ name: 'read', description: 'Read a file', inputSchema: { type: 'object', properties: {} } }];
     publishPluginSurface('core', 'Chat On Steroids Core', 'test', 'Synthetic instructions', tools);
     const requests = (await post('/plugin-refresh', { action: 'pending' })).body.requests;
@@ -1377,9 +1522,24 @@ describe('IPC input delivery and Goal control integration', () => {
     expect((await post('/plugin-refresh', { ...identity, action: 'complete', tools, versionId: 'asdk_app_v_synthetic' })).body.ok).toBe(true);
     resetPluginRefreshForTests();
   });
+  it('accepts a stale connector only by the tunnel id configured for its surface', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, ui: { ...base.ui, autoRefreshPlugins: true }, tunnel: { ...base.tunnel, tunnelId: 'tunnel_core00001', desktopTunnelId: 'tunnel_desk00001' } });
+    const { publishPluginSurface, resetPluginRefreshForTests, setPluginRefreshTunnelGraceForTests } = await import('../src/main/plugin-refresh.js');
+    resetPluginRefreshForTests(); setPluginRefreshTunnelGraceForTests(0);
+    await writeDurableNow('plugin-refresh', []);
+    const tools = [{ name: 'computer', description: 'Current', inputSchema: { type: 'object', properties: {} } }];
+    publishPluginSurface('desktop', 'Chat On Steroids Desktop', 'test', '', tools);
+    const [request] = (await post('/plugin-refresh', { action: 'pending' })).body.requests;
+    const claim = (tunnelId?: string) => post('/plugin-refresh', { id: request.id, appId: 'asdk_app_desktop', action: 'claim', connectorName: 'Chat On Steroids Desktop', tools: [{ name: 'observe', description: 'Old', inputSchema: { type: 'object' } }], tunnelId });
+    expect((await claim()).body.ok).toBe(false);
+    expect((await claim('tunnel_core00001')).body.ok).toBe(false); // Core's tunnel is not Desktop's
+    expect((await claim('tunnel_desk00001')).body.ok).toBe(true);
+    resetPluginRefreshForTests();
+  });
   it('defaults automatic plugin refresh off and revokes an already offered claim without removing the backend', async () => {
     const plugin = await import('../src/main/plugin-refresh.js');
-    plugin.resetPluginRefreshForTests();
+    plugin.resetPluginRefreshForTests(); plugin.setPluginRefreshTunnelGraceForTests(0);
     await writeDurableNow('plugin-refresh', []);
     const tools = [{ name: 'read', description: 'Current declaration', inputSchema: { type: 'object', properties: {} } }];
     plugin.publishPluginSurface('core', 'Chat On Steroids Core', 'test', '', tools);
@@ -1399,12 +1559,12 @@ describe('IPC input delivery and Goal control integration', () => {
     await configure(false);
     // A click already accepted while enabled may still report its real result.
     expect((await post('/plugin-refresh', { ...claim, action: 'complete', tools })).body.ok).toBe(true);
-    plugin.resetPluginRefreshForTests();
+    plugin.resetPluginRefreshForTests(); plugin.setPluginRefreshTunnelGraceForTests(0);
   });
   it('accepts a manual plugin-refresh terminal state and removes it from browser pickup', async () => {
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: true } });
-    const { publishPluginSurface, resetPluginRefreshForTests } = await import('../src/main/plugin-refresh.js');
-    resetPluginRefreshForTests();
+    const { publishPluginSurface, resetPluginRefreshForTests, setPluginRefreshTunnelGraceForTests } = await import('../src/main/plugin-refresh.js');
+    resetPluginRefreshForTests(); setPluginRefreshTunnelGraceForTests(0);
     const tools = [{ name: 'read', description: 'Read current', inputSchema: { type: 'object', properties: {} } }];
     const installed = [{ ...tools[0], description: 'Read old' }];
     publishPluginSurface('core', 'Chat On Steroids Core', 'test', 'Synthetic instructions', tools);
@@ -1762,6 +1922,34 @@ describe('native progress silence authority', () => {
     await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
   }
 
+  /**
+   * A rescue that was withdrawn must not stand in for the one the chat still needs.
+   *
+   * The ticket is cancelled for a good reason — the chat resumed on its own, so typing into it
+   * would be noise — but the check that keeps one ticket per turn counted the cancelled row all
+   * the same. Watched live on 2026-09-23: a rescue filed at 20:32:35, cancelled fifteen seconds
+   * later as "the source received new work", and the same turn broke again two minutes after
+   * that. The second rescue was refused on the strength of the first, and the chat sat until its
+   * owner typed into it.
+   */
+  it('files a second rescue for a turn whose first was cancelled without ever sending', async () => {
+    const source = await open('gpt-5.6-sol');
+    expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+    const first = (await input.listInputs()).find(row => row.recovery)!;
+    expect(first.silenceBoundary?.turnId).toBe(source.turnId);
+
+    // Withdrawn because the chat carried on by itself — nothing was ever sent.
+    expect(await input.cancelInput(first.id)).toBe(true);
+    expect((await input.listInputs()).find(row => row.id === first.id)?.state).toBe('cancelled');
+
+    // The same turn breaks again. This is the rescue that used to be refused.
+    expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true),
+      'a cancelled ticket still blocked the turn it never answered').toBe(true);
+    const live = (await input.listInputs()).filter(row => row.recovery && row.state === 'queued');
+    expect(live).toHaveLength(1);
+    expect(live[0]!.id).not.toBe(first.id);
+  });
+
   it('keeps authored queued work ahead of automatic Continue after a committed handoff', async () => {
     let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
     try {
@@ -2118,6 +2306,85 @@ describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)'
     } finally { clock.mockRestore(); }
   });
 
+  it.each(['queued', 'claimed', 'authorized'] as const)('hands a late final from %s Continue back to the active driver', async phase => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const { row, conversationId, session, turnId } = await silent('gpt-5.6-sol', ms => { now += ms; });
+      if (mode !== 'off') await goal.setGoalObjectiveNow(conversationId, 'Finish the remaining implementation');
+      const claim = { id: row.id, owner: 'late-final-document', conversationId };
+      if (phase !== 'queued') expect((await post('/input/claim', { ...claim, requiresAuthorization: true })).body.input).toBeDefined();
+      if (phase === 'authorized') expect((await post('/input/claim', { ...claim, authorize: true })).body.ok).toBe(true);
+      // The native pre-click check discovers and journals the actual final after
+      // the app has granted permission, but before any native Send was attempted.
+      const final = { kind: 'assistant_message', messageId: randomUUID(), providerMessageId: randomUUID(), turnId,
+        text: 'The first part is ready. The remaining implementation still needs work.',
+        state: 'final', final: true, activeNow: true, goalEligible: true, time: ++now };
+      expect((await post('/events', { conversationId, events: [final] })).status).toBe(200);
+      if (phase === 'authorized') {
+        const failure = { ...claim, error: 'After-turn pickup was withdrawn before Send.' };
+        expect((await post('/input/fail', { ...failure, owner: 'different-document' })).body.ok).toBe(false);
+        expect(await input.inputBeforeGoal(session.id, turnId)).toBe('queued');
+        expect((await post('/input/fail', failure)).body.ok).toBe(true);
+        expect((await post('/input/fail', failure)).body.ok).toBe(false);
+        expect(await input.acknowledgeBrowserInput(row.id, claim.owner, conversationId, 'impossible-receipt')).toBe(false);
+        expect((await input.listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed', sendAuthorizedAt: expect.any(Number) });
+      }
+      input.resetInputForTests();
+      expect(await input.inputBeforeGoal(session.id, turnId)).toBeNull();
+      expect((await input.pendingBrowserInputs()).some(entry => entry.id === row.id)).toBe(false);
+      expect(await input.authorizeBrowserInput(row.id, claim.owner, conversationId)).toBe(false);
+      if (mode === 'off') expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
+      else {
+        expect(goal.goalPendingReplyFor(conversationId)?.replyId).toBe(final.messageId);
+        now += 60_000;
+        const result = await post('/goal/draft', { conversationId, turnId, clientId: claim.owner, terminalRequired: true });
+        expect(result.status).toBe(200);
+        let helper: Awaited<ReturnType<typeof input.listInputs>>[number] | undefined;
+        await vi.waitFor(async () => {
+          helper = (await input.listInputs()).find(entry => entry.purpose === 'decision' && entry.decisionSourceSessionId === session.id);
+          expect(helper).toBeDefined();
+        });
+        const helperClaim = { id: helper!.id, owner: 'decision-document', conversationId: null };
+        const prepared = (await post('/input/claim', { ...helperClaim, requiresAuthorization: true })).body.input;
+        expect(prepared.text).toContain(final.text);
+        expect((await post('/input/claim', { ...helperClaim, authorize: true })).body.ok).toBe(true);
+        expect((await post('/input/ack', { ...helperClaim, messageId: 'decision-question' })).body.ok).toBe(true);
+        expect((await post('/input/answer', { ...helperClaim,
+          response: JSON.stringify({ action: 'continue', reply: 'Finish the remaining implementation and verify it.' }) })).body.ok).toBe(true);
+        await vi.waitFor(() => expect(goal.goalViewFor(conversationId)?.stage).toBe('ready'));
+        expect(goal.goalViewFor(conversationId)?.reply).toBeTruthy();
+        expect(goal.goalViewFor(conversationId)?.reply).not.toBe(row.text);
+      }
+    } finally { clock.mockRestore(); }
+  });
+
+  it('keeps an ambiguous Continue exclusive until its exact native receipt arrives', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const { row, conversationId, session, turnId } = await silent('gpt-5.6-sol', ms => { now += ms; });
+      if (mode !== 'off') await goal.setGoalObjectiveNow(conversationId, 'Finish the remaining implementation');
+      expect(await input.claimBrowserInput(row.id, 'uncertain-document', conversationId, true)).not.toBeNull();
+      expect(await input.authorizeBrowserInput(row.id, 'uncertain-document', conversationId)).toBe(true);
+      await post('/events', { conversationId, events: [{ kind: 'assistant_message',
+        messageId: randomUUID(), providerMessageId: randomUUID(), turnId, text: 'The first part is ready.',
+        state: 'final', final: true, activeNow: true, goalEligible: true, time: ++now }] });
+      input.resetInputForTests();
+      expect(await input.inputBeforeGoal(session.id, turnId)).toBe('queued');
+      expect(await input.failBrowserInput(row.id, 'uncertain-document', 'The response timed out')).toBe(false);
+      expect(await input.inputBeforeGoal(session.id, turnId)).toBe('queued');
+      expect(await input.claimBrowserInput(row.id, 'replacement-document', conversationId, true)).toBeNull();
+      expect(await input.authorizeBrowserInput(row.id, 'uncertain-document', conversationId)).toBe(false);
+      if (mode !== 'off') {
+        expect(goal.goalPendingReplyFor(conversationId)).not.toBeNull();
+        const result = await post('/goal/draft', { conversationId, turnId, clientId: 'replacement-document', terminalRequired: true });
+        expect(result.body.error).toBe('user_input_pending');
+      }
+      expect(await input.acknowledgeBrowserInput(row.id, 'uncertain-document', conversationId, 'actual-continue-message')).toBe(true);
+      expect(await input.inputBeforeGoal(session.id, turnId)).toBe('consumed');
+      expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
+    } finally { clock.mockRestore(); }
+  });
+
   it('gives Pro five full minutes after a delayed reload acknowledgement', async () => {
     let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
     try {
@@ -2439,4 +2706,63 @@ describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)'
         if (change === 'question') expect(cancelled.error).toBe('Automatic Continue cancelled: another user message arrived.');
       } finally { clock.mockRestore(); }
     });
+});
+
+it('retires a lost authorized browser receipt so the session accepts and delivers the next user message', async () => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const conversationId = randomUUID(), turnId = randomUUID();
+    const session = await createSession({ title: 'Lost send receipt', conversationId });
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'turn_start', turnId, time: now },
+      { kind: 'assistant_message', messageId: randomUUID(), turnId, text: 'Done.', state: 'final', final: true, time: ++now },
+      { kind: 'turn_end', turnId, outcome: 'completed', time: ++now }
+    ] });
+    const lost = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'First request' });
+    expect(await input.claimBrowserInput(lost.id, 'lost-document', conversationId, true)).not.toBeNull();
+    expect(await input.authorizeBrowserInput(lost.id, 'lost-document', conversationId)).toBe(true);
+    // The receipt never arrives, so the uncertain claim still owns the whole session.
+    await expect(input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'Second request' }))
+      .rejects.toThrow('One message is already awaiting delivery');
+    now += 899_999;
+    input.resetInputForTests();
+    expect((await input.listInputs()).find(item => item.id === lost.id)?.state).toBe('browser');
+    await expect(input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'Second request' }))
+      .rejects.toThrow('One message is already awaiting delivery');
+    // The bounded wait elapses across a restart, and the lost outcome is now visible.
+    now += 1;
+    input.resetInputForTests();
+    expect((await input.listInputs()).find(item => item.id === lost.id)).toMatchObject({
+      state: 'cancelled',
+      error: 'Stopped waiting for delivery confirmation. The message may already have been sent; it will not be resent.'
+    });
+    // A terminal row is never offered or replayed, so at-most-once delivery is unchanged.
+    expect((await input.pendingBrowserInputs()).map(item => item.id)).not.toContain(lost.id);
+    expect(await input.claimBrowserInput(lost.id, 'replacement-document', conversationId, true)).toBeNull();
+    const next = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'Second request' });
+    expect(await input.claimBrowserInput(next.id, 'replacement-document', conversationId, true)).not.toBeNull();
+  } finally { clock.mockRestore(); }
+});
+
+it('retires an opening send whose receipt never arrives after six hours, and not before', async () => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    // Measured 2026-09-27: first messages of app-started chats stayed in `browser` for days.
+    const request = message(null, 'off');
+    expect((await handlers.get('sessions:send')!(null, request)).ok).toBe(true);
+    const owner = `document-${request.id}`;
+    expect((await post('/input/claim', { id: request.id, owner, conversationId: null, requiresAuthorization: true })).body.input).toMatchObject({ opening: true });
+    expect((await post('/input/claim', { id: request.id, owner, conversationId: null, authorize: true })).body.ok).toBe(true);
+    now += 15 * 60_000 + 1; // past the ordinary bound, which leaves openings in custody
+    input.resetInputForTests();
+    expect((await input.listInputs()).find(row => row.id === request.id)?.state).toBe('browser');
+    now += 6 * 60 * 60_000;
+    input.resetInputForTests();
+    expect((await input.listInputs()).find(row => row.id === request.id)).toMatchObject({
+      state: 'cancelled',
+      error: 'Stopped waiting for delivery confirmation. The message may already have been sent; it will not be resent.'
+    });
+    expect((await input.pendingBrowserInputs()).map(row => row.id)).not.toContain(request.id);
+  } finally { clock.mockRestore(); }
 });
